@@ -9,7 +9,13 @@
       <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
       <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd</Extensions>
     </Filter>
-    <Filter Include="リソース ファイル">
+    <Filter Include="xed">
+      <UniqueIdentifier>{80af6e34-bd16-4b7a-80f8-c1e117331d10}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="stream">
+      <UniqueIdentifier>{2b4073a1-8820-4b4e-a4c0-89ee9b82fb27}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="vmp">
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
@@ -18,13 +24,61 @@
     <ClInclude Include="pch.h">
       <Filter>ヘッダー ファイル</Filter>
     </ClInclude>
+    <ClInclude Include="x86_instruction.hpp">
+      <Filter>xed</Filter>
+    </ClInclude>
+    <ClInclude Include="x86_operand.hpp">
+      <Filter>xed</Filter>
+    </ClInclude>
+    <ClInclude Include="x86_register.hpp">
+      <Filter>xed</Filter>
+    </ClInclude>
+    <ClInclude Include="AbstractStream.hpp">
+      <Filter>stream</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessStream.hpp">
+      <Filter>stream</Filter>
+    </ClInclude>
+    <ClInclude Include="VMHandler.hpp">
+      <Filter>vmp</Filter>
+    </ClInclude>
+    <ClInclude Include="deobfuscator.hpp">
+      <Filter>vmp</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtualMachine.hpp">
+      <Filter>vmp</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
-    <ClCompile Include="VMProtectTest.cpp">
+    <ClCompile Include="main.cpp">
       <Filter>ソース ファイル</Filter>
+    </ClCompile>
+    <ClCompile Include="x86_instruction.cpp">
+      <Filter>xed</Filter>
+    </ClCompile>
+    <ClCompile Include="x86_operand.cpp">
+      <Filter>xed</Filter>
+    </ClCompile>
+    <ClCompile Include="x86_register.cpp">
+      <Filter>xed</Filter>
+    </ClCompile>
+    <ClCompile Include="AbstractStream.cpp">
+      <Filter>stream</Filter>
+    </ClCompile>
+    <ClCompile Include="ProcessStream.cpp">
+      <Filter>stream</Filter>
+    </ClCompile>
+    <ClCompile Include="VMHandler.cpp">
+      <Filter>vmp</Filter>
+    </ClCompile>
+    <ClCompile Include="deobfuscator.cpp">
+      <Filter>vmp</Filter>
+    </ClCompile>
+    <ClCompile Include="VirtualMachine.cpp">
+      <Filter>vmp</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

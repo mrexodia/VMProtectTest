@@ -9,6 +9,24 @@
 #ifndef PCH_H
 #define PCH_H
 
+// https://github.com/intelxed/xed
+extern "C"
+{
+#include <xed/xed-interface.h>
+}
+
 // TODO: ここでプリコンパイルするヘッダーを追加します
+#include <Windows.h>
+
+// C++
+#include <array>
+#include <list>
+#include <map>
+#include <memory>
+#include <set>
+#include <vector>
+
+#include <sstream>
+#include <iostream>
 
 #endif //PCH_H
