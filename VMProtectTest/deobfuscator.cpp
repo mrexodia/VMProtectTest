@@ -3,6 +3,9 @@
 #include "deobfuscator.hpp"
 #include "x86_instruction.hpp"
 #include "ProcessStream.hpp"
+#include <triton/api.hpp>
+#include <triton/x86Specifications.hpp>
+#pragma comment(lib, "triton.lib")
 
 // structures
 struct BasicBlock
@@ -19,12 +22,6 @@ struct BasicBlock
 	std::map<x86_register, bool> dead_registers;
 
 	std::shared_ptr<BasicBlock> next_basic_block, target_basic_block;
-};
-struct x86_memory_operand
-{
-	x86_register base_register, index_register, segment_register;
-	xed_uint_t scale;
-	xed_int64_t displacement;
 };
 
 bool modifiesIP(const std::shared_ptr<x86_instruction>& instruction)
@@ -116,7 +113,7 @@ void identify_leaders(AbstractStream& stream, unsigned long long leader,
 					return;
 				}
 
-				[[fallthrough]] ;
+//				[[fallthrough]] ;
 			}
 			case XED_CATEGORY_RET:
 			{
@@ -228,7 +225,7 @@ std::shared_ptr<BasicBlock> make_basic_blocks(AbstractStream& stream, unsigned l
 					goto return_basic_block;
 				}
 
-				[[fallthrough]] ;
+//				[[fallthrough]] ;
 			}
 			case XED_CATEGORY_RET:			// or return
 			{
@@ -386,15 +383,15 @@ unsigned int deobfuscate_basic_block(std::shared_ptr<BasicBlock>& basic_block)
 	std::map<x86_register, bool> dead_registers;
 	if (basic_block->terminator)
 	{
-		// ebx / esi / ebp / esp
-		dead_registers[XED_REG_EAX] = true;
+		// for vmp handlers
+		dead_registers[XED_REG_EAX] = true;			// dead
 		dead_registers[XED_REG_EBX] = false;
-		dead_registers[XED_REG_ECX] = true;
-		dead_registers[XED_REG_EDX] = true;
+		dead_registers[XED_REG_ECX] = true;			// dead
+		dead_registers[XED_REG_EDX] = true;			// dead
 		dead_registers[XED_REG_ESI] = false;
 		dead_registers[XED_REG_EDI] = false;
-		dead_registers[XED_REG_EBP] = true;
-		dead_registers[XED_REG_ESP] = true;
+		dead_registers[XED_REG_EBP] = false;
+		dead_registers[XED_REG_ESP] = false;
 		dead_registers[XED_REG_EIP] = false;
 		dead_registers[XED_REG_EFLAGS] = true;
 	}
@@ -435,16 +432,55 @@ unsigned int deobfuscate_basic_block(std::shared_ptr<BasicBlock>& basic_block)
 	return removed_bytes;
 }
 
-void categorize_handler(ProcessStream& stream, unsigned long long handler_address)
+void print_basic_blocks(const std::shared_ptr<BasicBlock> &first_basic_block)
+{
+	std::set<unsigned long long> visit_for_print;
+	std::shared_ptr<BasicBlock> basic_block = first_basic_block;
+	for (auto it = basic_block->instructions.begin(); it != basic_block->instructions.end();)
+	{
+		const auto& instruction = *it;
+		if (++it != basic_block->instructions.end())
+		{
+			// loop until it reaches end
+			instruction->print();
+			continue;
+		}
+
+		// dont print unconditional jmp, they are annoying
+		if (instruction->get_category() != XED_CATEGORY_UNCOND_BR
+			|| instruction->get_branch_displacement_width() == 0)
+		{
+			instruction->print();
+		}
+
+		visit_for_print.insert(basic_block->leader);
+		if (basic_block->next_basic_block && visit_for_print.count(basic_block->next_basic_block->leader) <= 0)
+		{
+			// print next
+			basic_block = basic_block->next_basic_block;
+		}
+		else if (basic_block->target_basic_block && visit_for_print.count(basic_block->target_basic_block->leader) <= 0)
+		{
+			// it ends with jmp?
+			basic_block = basic_block->target_basic_block;
+		}
+		else
+		{
+			// perhaps finishes?
+			break;
+		}
+
+		it = basic_block->instructions.begin();
+	}
+}
+
+void deobfuscate_vmp(ProcessStream& stream, unsigned long long handler_address)
 {
 	// explore until it finds ret/jmp r32?
 	std::set<unsigned long long> visit;
 	std::set<unsigned long long> leaders;
 
-	/*std::cout << "+identify_leaders:" << std::endl;
-	identify_leaders(stream, handler_address, leaders, visit);
-	std::cout << "-identify_leaders:" << std::endl << std::endl;*/
-
+	// not the best impl :|
 	leaders.insert(handler_address);
 	auto old_leaders_size = leaders.size();
 	do
@@ -460,6 +496,7 @@ void categorize_handler(ProcessStream& stream, unsigned long long handler_addres
 	std::shared_ptr<BasicBlock> first_basic_block = make_basic_blocks(stream, handler_address, leaders, basic_blocks);
 	std::cout << "-make_basic_blocks:" << std::endl;
 
+	// not the best impl :|
 	unsigned int removed_bytes;
 	for (int i = 0; i < 10; i++)
 	{
@@ -468,33 +505,47 @@ void categorize_handler(ProcessStream& stream, unsigned long long handler_addres
 			removed_bytes += deobfuscate_basic_block(pair.second);
 		printf("removed %d\n", removed_bytes);
 	}
-	for (const auto& pair : basic_blocks)
-	{
-		std::cout << pair.first << std::endl;
-		if (false)
-		{
-			std::cout << "dead registers" << std::endl;
-			for (const auto& dead_register_pair : pair.second->dead_registers)
-			{
-				if (dead_register_pair.second)
-					std::cout << "\t" << dead_register_pair.first.get_name() << std::endl;
-			}
-		}
-		for (const auto& instruction : pair.second->instructions)
-		{
-			std::cout << "\t";
-			instruction->print();
-		}
-	}
 
-	/*std::shared_ptr<BasicBlock> basic_block = first_basic_block;
+	// print them
+	std::cout << std::endl;
+	print_basic_blocks(first_basic_block);
+	std::cout << std::endl;
+
+	// symblic execution
+	auto triton_api = std::make_unique<triton::API>();
+	triton_api->setArchitecture(triton::arch::ARCH_X86);
+	triton_api->setAstRepresentationMode(triton::ast::representations::PYTHON_REPRESENTATION);
+
+	triton_api->symbolizeRegister(triton_api->registers.x86_esi, "x86_esi")->setAlias("p-code");
+	auto edi = triton_api->symbolizeRegister(triton_api->registers.x86_esi, "x86_edi");
+	triton_api->setConcreteVariableValue(edi, 1024);
+
+	//triton_api->addCallback(best_simplification);
+	//triton_api->addCallback(check_concrete_register);
+	//triton_api->addCallback(set_concrete_register);
+	//triton_api->addCallback(check_concrete_memory);
+	//triton_api->addCallback(set_concrete_memory);
+
+	std::shared_ptr<BasicBlock> basic_block = first_basic_block;
 	for (auto it = basic_block->instructions.begin(); it != basic_block->instructions.end();)
 	{
 		const auto& instruction = *it;
+		const std::vector<xed_uint8_t> bytes = instruction->get_bytes();
+		triton::arch::Instruction triton_instruction;
+		triton_instruction.setOpcode(&bytes[0], bytes.size());
+		triton_instruction.setAddress(instruction->get_addr());
+
+		triton_api->processing(triton_instruction);
 		if (++it != basic_block->instructions.end())
 		{
-			auto a = *it;
-			a->print();
+			// loop until it reaches end
+			std::cout << triton_instruction << std::endl;
+			continue;
+		}
+
+		if (!instruction->is_branch())
+		{
+			std::cout << triton_instruction << std::endl;
 		}
 
 		if (basic_block->next_basic_block && basic_block->target_basic_block)
@@ -526,7 +577,29 @@ void categorize_handler(ProcessStream& stream, unsigned long long handler_addres
 		}
 
 		it = basic_block->instructions.begin();
-	}*/
+	}
+
+	/*for (const auto& pair : triton_api->getSymbolicExpressions())
+	{
+		auto expr = pair.second;
+		std::cout << "\tSymExpr" << pair.first << " : " << expr << std::endl;
+		if (expr->isRegister())
+		{
+			std::cout << "\t\t" << expr->getOriginRegister() << std::endl;
+		}
+		else if (expr->isMemory())
+		{
+			std::cout << "\t\t" << expr->getOriginMemory() << std::endl;
+			auto memoryAst = triton_api->getMemoryAst(expr->getOriginMemory());
+			std::cout << "\t\t" << memoryAst->evaluate() << std::endl;
+		}
+	}
+
+	triton::ast::SharedAbstractNode esi_ast = triton_api->getRegisterAst(triton_api->registers.x86_esi);
+	std::cout << "esi: " << triton_api->processSimplification(esi_ast, true) << std::endl;
+
+	triton::ast::SharedAbstractNode edi_ast = triton_api->getRegisterAst(triton_api->registers.x86_edi);
+	std::cout << "edi: " << triton_api->processSimplification(edi_ast, true) << std::endl;*/
 }
 void vmprotect_test(unsigned long pid)
 {
@@ -534,5 +607,9 @@ void vmprotect_test(unsigned long pid)
 	if (!stream.open(pid))
 		throw std::runtime_error("open failed");
 
-	categorize_handler(stream, 0x004892AF);
+	deobfuscate_vmp(stream, 0x0040C890);
+	//deobfuscate_vmp(stream, 0x004892AF);
+	//deobfuscate_vmp(stream, 0x00493FB7);
+	//deobfuscate_vmp(stream, 0x0043CEBF);
+	//deobfuscate_vmp(stream, 0x0042EDA2);
 }
