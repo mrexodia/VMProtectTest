@@ -88,6 +88,12 @@ public:
 	x86_register get_gpr32() const;		// eax, ecx, edx, ebx
 	x86_register get_gpr64() const;		// rax, rcx, rdx, rbx
 
+	// flag
+	bool is_flag() const
+	{
+		return XED_REG_FLAGS_FIRST <= this->m_xed_reg && this->m_xed_reg <= XED_REG_RFLAGS;
+	}
+
 private:
 	xed_reg_enum_t m_xed_reg;
 };

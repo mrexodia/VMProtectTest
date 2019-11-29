@@ -20,6 +20,7 @@ struct BasicBlock
 
 	// dead registers when it enters basic block
 	std::map<x86_register, bool> dead_registers;
+	xed_uint32_t dead_flags;
 
 	std::shared_ptr<BasicBlock> next_basic_block, target_basic_block;
 };
@@ -245,7 +246,7 @@ return_basic_block:
 }
 
 // dead store elimination based on register
-unsigned int apply_dead_store_elimination(std::list<std::shared_ptr<x86_instruction>>& instructions, std::map<x86_register, bool>& dead_registers)
+unsigned int apply_dead_store_elimination(std::list<std::shared_ptr<x86_instruction>>& instructions, std::map<x86_register, bool>& dead_registers, xed_uint32_t& dead_flags)
 {
 	unsigned int removed_bytes = 0;
 	for (auto it = instructions.rbegin(); it != instructions.rend();)
@@ -262,10 +263,25 @@ unsigned int apply_dead_store_elimination(std::list<std::shared_ptr<x86_instruct
 			//goto update_dead_registers;
 		}
 
+		// check flags
+		xed_uint32_t read_flags = 0, written_flags = 0, alive_flags = ~dead_flags;
+		if (instr->uses_rflags())
+		{
+			read_flags = instr->get_read_flag_set()->flat;
+			written_flags = instr->get_written_flag_set()->flat;
+			if (alive_flags & written_flags)
+			{
+				// alive_flags being written by the instruction thus can't remove right?
+				goto update_dead_registers;
+			}
+		}
+
 		// check if instruction can be removed
 		for (const auto& writtenRegister : writtenRegs)
 		{
-			//std::cout << writtenRegister.get_largest_enclosing_register32().get_name();
+			if (writtenRegister.is_flag())
+				continue;
+
 			auto pair = dead_registers.find(writtenRegister.get_largest_enclosing_register32());
 			if (pair == dead_registers.end() || !pair->second)
 			{
@@ -306,27 +322,35 @@ unsigned int apply_dead_store_elimination(std::list<std::shared_ptr<x86_instruct
 		}
 
 		// update dead registers
-update_dead_registers:
+	update_dead_registers:
+
+		// check flags
+		if (instr->uses_rflags())
+		{
+			dead_flags |= written_flags;	// add written flags
+			dead_flags &= ~read_flags;		// and remove read flags
+		}
+
+		//instr->print();
 		for (const auto& writtenRegister : writtenRegs)
 		{
+			//printf("\tW: %s\n", writtenRegister.get_name());
+			if (writtenRegister.is_flag())
+				continue;
+
 			const x86_register reg = writtenRegister.get_largest_enclosing_register32();
 			if (reg != XED_REG_EIP)
 				dead_registers[reg] = true;
 		}
 		for (const auto& readRegister : readRegs)
 		{
+			//printf("\tR: %s\n", readRegister.get_name());
+			if (readRegister.is_flag())
+				continue;
+
 			const x86_register reg = readRegister.get_largest_enclosing_register32();
 			dead_registers[reg] = false;
 		}
-
-		/*if (it->get_iclass() == XED_ICLASS_POPFD)
-		{
-			for (xed_reg_enum_t i = XED_REG_FLAGS_FIRST; i <= XED_REG_FLAGS_LAST;)
-			{
-				dead_registers[i] = true;
-				i = xed_reg_enum_t(i + 1);
-			}
-		}*/
 
 		++it;
 	}
@@ -381,6 +405,7 @@ unsigned int deobfuscate_basic_block(std::shared_ptr<BasicBlock>& basic_block)
 {
 	// all registers / memories should be considered 'ALIVE' when it enters basic block or when it leaves basic block
 	std::map<x86_register, bool> dead_registers;
+	xed_uint32_t dead_flags = 0;
 	if (basic_block->terminator)
 	{
 		// for vmp handlers
@@ -393,7 +418,9 @@ unsigned int deobfuscate_basic_block(std::shared_ptr<BasicBlock>& basic_block)
 		dead_registers[XED_REG_EBP] = false;
 		dead_registers[XED_REG_ESP] = false;
 		dead_registers[XED_REG_EIP] = false;
-		dead_registers[XED_REG_EFLAGS] = true;
+
+		// all flags must be dead
+		dead_flags = 0xFFFFFFFF;
 	}
 	else
 	{
@@ -412,14 +439,20 @@ unsigned int deobfuscate_basic_block(std::shared_ptr<BasicBlock>& basic_block)
 				if (it != dead_registers2.end() && it->second)
 					dead_registers.insert(std::make_pair(dead_reg, true));
 			}
+
+			const xed_uint32_t dead_flags1 = basic_block->next_basic_block->dead_flags;
+			const xed_uint32_t dead_flags2 = basic_block->target_basic_block->dead_flags;
+			dead_flags = dead_flags1 & dead_flags2;
 		}
 		else if (basic_block->next_basic_block)
 		{
 			dead_registers = basic_block->next_basic_block->dead_registers;
+			dead_flags = basic_block->next_basic_block->dead_flags;
 		}
 		else if (basic_block->target_basic_block)
 		{
 			dead_registers = basic_block->target_basic_block->dead_registers;
+			dead_flags = basic_block->target_basic_block->dead_flags;
 		}
 		else
 		{
@@ -427,8 +460,9 @@ unsigned int deobfuscate_basic_block(std::shared_ptr<BasicBlock>& basic_block)
 		}
 	}
 
-	unsigned int removed_bytes = apply_dead_store_elimination(basic_block->instructions, dead_registers);
+	unsigned int removed_bytes = apply_dead_store_elimination(basic_block->instructions, dead_registers, dead_flags);
 	basic_block->dead_registers = dead_registers;
+	basic_block->dead_flags = dead_flags;
 	return removed_bytes;
 }
 
@@ -474,7 +508,28 @@ void print_basic_blocks(const std::shared_ptr<BasicBlock> &first_basic_block)
 	}
 }
 
-void deobfuscate_vmp(ProcessStream& stream, unsigned long long handler_address)
+// triton callbacks
+void _getConcreteMemoryValueCallback(triton::API& api, const triton::arch::MemoryAccess& mem)
+{
+	// arguments test
+	std::cout << mem << std::endl;
+	return;
+
+	constexpr unsigned long long vmp_start = 0x00417000;
+	constexpr unsigned long long vmp_end = 0x0049DCB0;
+	if (vmp_start <= mem.getAddress() && mem.getAddress() < vmp_end)
+	{
+		printf("vmp add %016llX\n", mem.getAddress());
+		//api.setConcreteMemoryValue(mem, 0);
+		api.symbolizeMemory(mem, "BLUH")->setAlias("YOOOO");
+		api.setConcreteMemoryValue(mem, 0x1ECBF564);
+	}
+}
+void _getConcreteRegisterValueCallback(triton::API& api, const triton::arch::Register& reg)
+{
+}
+
+std::shared_ptr<BasicBlock> explore(ProcessStream& stream, unsigned long long handler_address)
 {
 	// explore until it finds ret/jmp r32?
 	std::set<unsigned long long> visit;
@@ -510,96 +565,156 @@ void deobfuscate_vmp(ProcessStream& stream, unsigned long long handler_address)
 	std::cout << std::endl;
 	print_basic_blocks(first_basic_block);
 	std::cout << std::endl;
+	return first_basic_block;
+}
 
+
+void deobfuscate_vmp(ProcessStream& stream, unsigned long long handler_address)
+{
 	// symblic execution
 	auto triton_api = std::make_unique<triton::API>();
 	triton_api->setArchitecture(triton::arch::ARCH_X86);
 	triton_api->setAstRepresentationMode(triton::ast::representations::PYTHON_REPRESENTATION);
 
 	triton_api->symbolizeRegister(triton_api->registers.x86_esi, "x86_esi")->setAlias("p-code");
-	auto edi = triton_api->symbolizeRegister(triton_api->registers.x86_esi, "x86_edi");
-	triton_api->setConcreteVariableValue(edi, 1024);
+	triton_api->symbolizeRegister(triton_api->registers.x86_ebp, "x86_ebp")->setAlias("vm-stack");
+	triton_api->setConcreteRegisterValue(triton_api->registers.x86_ebp, 1024);
 
-	//triton_api->addCallback(best_simplification);
-	//triton_api->addCallback(check_concrete_register);
-	//triton_api->addCallback(set_concrete_register);
-	//triton_api->addCallback(check_concrete_memory);
-	//triton_api->addCallback(set_concrete_memory);
+	triton_api->addCallback(_getConcreteMemoryValueCallback);
+	triton_api->addCallback(_getConcreteRegisterValueCallback);
 
-	std::shared_ptr<BasicBlock> basic_block = first_basic_block;
-	for (auto it = basic_block->instructions.begin(); it != basic_block->instructions.end();)
+	// concretize vmp section memory
+	unsigned long long vmp_section_address = (0x00400000 + 0x17000);
+	unsigned long vmp_section_size = 0x86CB0;
+	void *vmp0 = malloc(vmp_section_size);
+
+	stream.seek(vmp_section_address);
+	if (stream.read(vmp0, vmp_section_size) != vmp_section_size)
+		throw std::runtime_error("stream.read failed");
+
+	// should be good
+	triton_api->setConcreteMemoryAreaValue(vmp_section_address, (const triton::uint8 *)vmp0, vmp_section_size);
+
+	// make stack
+	unsigned long long top_of_stack = 0;							// low address
+	constexpr unsigned long long stack_size = 1024 * 10;
+	unsigned long long bottom_of_stack = top_of_stack + stack_size;	// high address
+	triton_api->setConcreteMemoryAreaValue(top_of_stack, 0, 0);
+
+	for (int i = 0; i < 1; i++)
 	{
-		const auto& instruction = *it;
-		const std::vector<xed_uint8_t> bytes = instruction->get_bytes();
-		triton::arch::Instruction triton_instruction;
-		triton_instruction.setOpcode(&bytes[0], bytes.size());
-		triton_instruction.setAddress(instruction->get_addr());
-
-		triton_api->processing(triton_instruction);
-		if (++it != basic_block->instructions.end())
+		//
+		std::shared_ptr<BasicBlock> basic_block = explore(stream, handler_address);
+		for (auto it = basic_block->instructions.begin(); it != basic_block->instructions.end();)
 		{
-			// loop until it reaches end
-			std::cout << triton_instruction << std::endl;
-			continue;
-		}
+			const auto& instruction = *it;
+			const std::vector<xed_uint8_t> bytes = instruction->get_bytes();
+			triton::arch::Instruction triton_instruction;
+			triton_instruction.setOpcode(&bytes[0], bytes.size());
+			triton_instruction.setAddress(instruction->get_addr());
 
-		if (!instruction->is_branch())
-		{
-			std::cout << triton_instruction << std::endl;
-		}
+			triton_api->processing(triton_instruction);
 
-		if (basic_block->next_basic_block && basic_block->target_basic_block)
-		{
-			// it ends with conditional branch
-			if (triton_instruction.isConditionTaken())
+			//
+			constexpr bool show_symbolic_expressions = 0;
+			if (show_symbolic_expressions)
 			{
+				for (const auto& expr : triton_instruction.symbolicExpressions)
+				{
+					std::cout << "\tSymExpr" << "[]" << " : " << expr << std::endl;
+					if (expr->isRegister())
+					{
+						std::cout << "\t\t" << expr->getOriginRegister() << std::endl;
+					}
+					else if (expr->isMemory())
+					{
+						std::cout << "\t\t" << expr->getOriginMemory() << std::endl;
+						auto memoryAst = triton_api->getMemoryAst(expr->getOriginMemory());
+						std::cout << "\t\t" << memoryAst->evaluate() << std::endl;
+					}
+				}
+			}
+			//
+
+			if (++it != basic_block->instructions.end())
+			{
+				// loop until it reaches end
+				std::cout << triton_instruction << std::endl;
+				continue;
+			}
+
+			if (!instruction->is_branch())
+			{
+				std::cout << triton_instruction << std::endl;
+			}
+
+			if (basic_block->next_basic_block && basic_block->target_basic_block)
+			{
+				// it ends with conditional branch
+				if (triton_instruction.isConditionTaken())
+				{
+					basic_block = basic_block->target_basic_block;
+				}
+				else
+				{
+					basic_block = basic_block->next_basic_block;
+				}
+			}
+			else if (basic_block->target_basic_block)
+			{
+				// it ends with jmp?
 				basic_block = basic_block->target_basic_block;
+			}
+			else if (basic_block->next_basic_block)
+			{
+				// just follow :)
+				basic_block = basic_block->next_basic_block;
 			}
 			else
 			{
-				basic_block = basic_block->next_basic_block;
+				// perhaps finishes?
+				break;
+			}
+
+			it = basic_block->instructions.begin();
+		}
+
+		constexpr bool show_symbolic_expressions = 0;
+		if (show_symbolic_expressions)
+		{
+			for (const auto& pair : triton_api->getSymbolicExpressions())
+			{
+				auto expr = pair.second;
+				std::cout << "\tSymExpr" << pair.first << " : " << expr << std::endl;
+				if (expr->isRegister())
+				{
+					std::cout << "\t\t" << expr->getOriginRegister() << std::endl;
+				}
+				else if (expr->isMemory())
+				{
+					std::cout << "\t\t" << expr->getOriginMemory() << std::endl;
+					auto memoryAst = triton_api->getMemoryAst(expr->getOriginMemory());
+					std::cout << "\t\t" << memoryAst->evaluate() << std::endl;
+				}
 			}
 		}
-		else if (basic_block->target_basic_block)
+
+		triton::ast::SharedAbstractNode esi_ast = triton_api->getRegisterAst(triton_api->registers.x86_esi);
+		std::cout << "esi: " << triton_api->processSimplification(esi_ast, true) << std::endl;
+
+		triton::ast::SharedAbstractNode edi_ast = triton_api->getRegisterAst(triton_api->registers.x86_edi);
+		std::cout << "edi: " << triton_api->processSimplification(edi_ast, true) << std::endl;
+
+		// i assume edi is next handler address ?ADFASPKFAPOEKF
+		if (edi_ast->isSymbolized())
 		{
-			// it ends with jmp?
-			basic_block = basic_block->target_basic_block;
-		}
-		else if (basic_block->next_basic_block)
-		{
-			// just follow :)
-			basic_block = basic_block->next_basic_block;
-		}
-		else
-		{
-			// perhaps finishes?
+			std::cout << "edi ast is symbolized" << std::endl;
 			break;
 		}
 
-		it = basic_block->instructions.begin();
+		handler_address = edi_ast->evaluate().convert_to<unsigned long long>();
+		std::cout << handler_address << std::endl;
 	}
-
-	/*for (const auto& pair : triton_api->getSymbolicExpressions())
-	{
-		auto expr = pair.second;
-		std::cout << "\tSymExpr" << pair.first << " : " << expr << std::endl;
-		if (expr->isRegister())
-		{
-			std::cout << "\t\t" << expr->getOriginRegister() << std::endl;
-		}
-		else if (expr->isMemory())
-		{
-			std::cout << "\t\t" << expr->getOriginMemory() << std::endl;
-			auto memoryAst = triton_api->getMemoryAst(expr->getOriginMemory());
-			std::cout << "\t\t" << memoryAst->evaluate() << std::endl;
-		}
-	}
-
-	triton::ast::SharedAbstractNode esi_ast = triton_api->getRegisterAst(triton_api->registers.x86_esi);
-	std::cout << "esi: " << triton_api->processSimplification(esi_ast, true) << std::endl;
-
-	triton::ast::SharedAbstractNode edi_ast = triton_api->getRegisterAst(triton_api->registers.x86_edi);
-	std::cout << "edi: " << triton_api->processSimplification(edi_ast, true) << std::endl;*/
 }
 void vmprotect_test(unsigned long pid)
 {
@@ -607,9 +722,15 @@ void vmprotect_test(unsigned long pid)
 	if (!stream.open(pid))
 		throw std::runtime_error("open failed");
 
-	deobfuscate_vmp(stream, 0x0040C890);
+	//deobfuscate_vmp(stream, 0x0040C890);
 	//deobfuscate_vmp(stream, 0x004892AF);
 	//deobfuscate_vmp(stream, 0x00493FB7);
 	//deobfuscate_vmp(stream, 0x0043CEBF);
 	//deobfuscate_vmp(stream, 0x0042EDA2);
+
+	// NOR
+	//deobfuscate_vmp(stream, 0x0000000000463FB4);
+
+	// PUSH
+	deobfuscate_vmp(stream, 0x0000000000441CF6);
 }
