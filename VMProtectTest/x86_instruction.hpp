@@ -14,7 +14,8 @@ public:
 	x86_instruction(unsigned long long addr = 0);
 	~x86_instruction();
 
-	void decode(const void *buf, unsigned int length);
+	void decode(const void *buf, unsigned int length, 
+		xed_machine_mode_enum_t mmode, xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_32b);
 
 	// xed functions
 	inline const char* get_name() const
@@ -36,6 +37,10 @@ public:
 	inline xed_iclass_enum_t get_iclass() const
 	{
 		return xed_decoded_inst_get_iclass(this);
+	}
+	inline xed_uint_t get_machine_mode_bits() const
+	{
+		return xed_decoded_inst_get_machine_mode_bits(this);
 	}
 
 	// bytes

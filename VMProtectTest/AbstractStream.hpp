@@ -5,7 +5,9 @@
 class AbstractStream
 {
 protected:
-	AbstractStream();
+	bool m_x86_64;
+
+	AbstractStream(bool x86_64 = false);
 	virtual ~AbstractStream();
 
 public:

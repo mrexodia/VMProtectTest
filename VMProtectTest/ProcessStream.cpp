@@ -2,7 +2,7 @@
 
 #include "ProcessStream.hpp"
 
-ProcessStream::ProcessStream()
+ProcessStream::ProcessStream(bool x86_64) : AbstractStream(x86_64)
 {
 	this->m_processId = 0;
 	this->m_processHandle = NULL;

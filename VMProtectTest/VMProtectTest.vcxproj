@@ -157,18 +157,17 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="AbstractStream.hpp" />
-    <ClInclude Include="deobfuscator.hpp" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="ProcessStream.hpp" />
     <ClInclude Include="VirtualMachine.hpp" />
     <ClInclude Include="VMHandler.hpp" />
+    <ClInclude Include="VMProtectAnalyzer.hpp" />
     <ClInclude Include="x86_instruction.hpp" />
     <ClInclude Include="x86_operand.hpp" />
     <ClInclude Include="x86_register.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="AbstractStream.cpp" />
-    <ClCompile Include="deobfuscator.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
@@ -179,6 +178,7 @@
     <ClCompile Include="ProcessStream.cpp" />
     <ClCompile Include="VirtualMachine.cpp" />
     <ClCompile Include="VMHandler.cpp" />
+    <ClCompile Include="VMProtectAnalyzer.cpp" />
     <ClCompile Include="x86_instruction.cpp" />
     <ClCompile Include="x86_operand.cpp" />
     <ClCompile Include="x86_register.cpp" />

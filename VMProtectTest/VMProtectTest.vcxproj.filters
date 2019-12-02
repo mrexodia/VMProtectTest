@@ -42,10 +42,10 @@
     <ClInclude Include="VMHandler.hpp">
       <Filter>vmp</Filter>
     </ClInclude>
-    <ClInclude Include="deobfuscator.hpp">
+    <ClInclude Include="VirtualMachine.hpp">
       <Filter>vmp</Filter>
     </ClInclude>
-    <ClInclude Include="VirtualMachine.hpp">
+    <ClInclude Include="VMProtectAnalyzer.hpp">
       <Filter>vmp</Filter>
     </ClInclude>
   </ItemGroup>
@@ -74,10 +74,10 @@
     <ClCompile Include="VMHandler.cpp">
       <Filter>vmp</Filter>
     </ClCompile>
-    <ClCompile Include="deobfuscator.cpp">
+    <ClCompile Include="VirtualMachine.cpp">
       <Filter>vmp</Filter>
     </ClCompile>
-    <ClCompile Include="VirtualMachine.cpp">
+    <ClCompile Include="VMProtectAnalyzer.cpp">
       <Filter>vmp</Filter>
     </ClCompile>
   </ItemGroup>

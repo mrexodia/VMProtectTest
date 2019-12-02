@@ -9,12 +9,13 @@ x86_instruction::~x86_instruction()
 {
 }
 
-void x86_instruction::decode(const void* buf, unsigned int length)
+void x86_instruction::decode(const void* buf, unsigned int length,
+	xed_machine_mode_enum_t mmode, xed_address_width_enum_t stack_addr_width)
 {
 	// initialize for xed_decode
 	xed_decoded_inst_t *xedd = this;
 	xed_decoded_inst_zero(xedd);
-	xed_decoded_inst_set_mode(xedd, XED_MACHINE_MODE_LEGACY_32, XED_ADDRESS_WIDTH_32b);
+	xed_decoded_inst_set_mode(xedd, mmode, stack_addr_width);
 
 	// decode array of bytes to xed_decoded_inst_t
 	memcpy(this->m_bytes, buf, length);

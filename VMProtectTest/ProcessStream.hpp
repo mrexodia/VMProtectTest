@@ -5,7 +5,7 @@
 class ProcessStream : public AbstractStream
 {
 public:
-	ProcessStream();
+	ProcessStream(bool x86_64 = false);
 	~ProcessStream();
 
 	bool isOpen() const override;

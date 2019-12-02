@@ -23,10 +23,16 @@ extern "C"
 #include <list>
 #include <map>
 #include <memory>
+#include <stack>
 #include <set>
 #include <vector>
 
 #include <sstream>
 #include <iostream>
+
+// triton
+#include <triton/api.hpp>
+#include <triton/ast.hpp>
+#include <triton/x86Specifications.hpp>
 
 #endif //PCH_H
