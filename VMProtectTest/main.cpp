@@ -80,8 +80,43 @@ void vmp_ultimate()
 
 	VMProtectAnalyzer analyzer;
 	analyzer.load(stream, 0x00400000, 0x34000, 0x21CEE5);	// vmp0
+
+
+	analyzer.analyze_vm_enter(stream, 0x00401520);		// IsValidImageCRC
+
 	//analyzer.analyze_vm_enter(stream, 0x00401450);
-	analyzer.analyze_vm_enter(stream, 0x004014F0); // ultra
+	//analyzer.analyze_vm_enter(stream, 0x004014F0); // ultra
+	//analyzer.analyze_vm_enter(stream, 0x00401490); // mutation
+
+	unsigned long long handler_address = analyzer.get_ip();
+	std::cout << std::hex << handler_address << std::endl;
+	while (0x00400000 <= handler_address && handler_address <= (0x00400000 + 0x34000 + 0x21CEE5))
+	{
+		analyzer.analyze_vm_handler(stream, handler_address);
+		std::cout << std::endl << std::endl << std::endl << std::endl;
+		handler_address = analyzer.get_ip();
+	}
+
+	// idk
+	std::cout << std::endl << std::endl;
+	analyzer.print_output();
+}
+
+void test_v1()
+{
+	DWORD processId = find_process(L"devirtualizeme32_vmp_3.0.9_v1.exe");
+	printf("pid: %08X\n", processId);
+
+	ProcessStream stream;
+	if (!stream.open(processId))
+		throw std::runtime_error("stream.open failed.");
+
+	VMProtectAnalyzer analyzer;
+	analyzer.load(stream, 0x00400000, 0x17000, 0x86CB0);
+	analyzer.analyze_vm_enter(stream, 0x0040C890);
+	//analyzer.analyze_vm_enter(stream, 0x004312D7);
+	//analyzer.analyze_vm_enter(stream, 0x0041F618);
+	//analyzer.analyze_vm_enter(stream, 0x00477CBB);
 
 	unsigned long long handler_address = analyzer.get_ip();
 	std::cout << std::hex << handler_address << std::endl;
@@ -104,45 +139,8 @@ int main()
 
 	try
 	{
-		vmp_ultimate();
-		return 0;
-
-		DWORD processId = find_process(L"devirtualizeme32_vmp_3.0.9_v1.exe");
-		processId = find_process(L"devirtualizeme32_vmp_3.0.9_v2.exe");
-		printf("pid: %08X\n", processId);
-
-		ProcessStream stream;
-		if (!stream.open(processId))
-			throw std::runtime_error("stream.open failed.");
-
-		std::cout << "..." << std::endl;
-
-		VMProtectAnalyzer analyzer;
-		//analyzer.analyze_vm_enter(stream, 0x0040C890);
-		//analyzer.analyze_vm_enter(stream, 0x004312D7);
-		//analyzer.analyze_vm_enter(stream, 0x0041F618);
-		//analyzer.analyze_vm_enter(stream, 0x00477CBB);
-
-		// v2 1
-		analyzer.load(stream, 0x00870000, 0x1A000, 0x851A0);	// vmp0
-		analyzer.analyze_vm_enter(stream, 0x008802C0);
-		//analyzer.analyze_vm_enter(stream, 0x008B8A99); // after GetUserNameW
-
-		// v2 2
-		//analyzer.analyze_vm_enter(stream, 0x00880200);
-
-		unsigned long long handler_address = analyzer.get_ip();
-		std::cout << std::hex << handler_address << std::endl;
-		while (handler_address)
-		{
-			analyzer.analyze_vm_handler(stream, handler_address);
-			std::cout << std::endl << std::endl << std::endl << std::endl;
-			handler_address = analyzer.get_ip();
-		}
-
-		// idk
-		std::cout << std::endl << std::endl;
-		analyzer.print_output();
+		//vmp_ultimate();
+		test_v1();
 	}
 	catch (const std::exception &ex)
 	{

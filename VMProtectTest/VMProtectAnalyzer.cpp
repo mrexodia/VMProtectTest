@@ -281,7 +281,7 @@ unsigned int apply_dead_store_elimination(std::list<std::shared_ptr<x86_instruct
 		}
 
 		// check registers
-		for (const auto& writtenRegister : writtenRegs)
+		for (const x86_register& writtenRegister : writtenRegs)
 		{
 			if (writtenRegister.is_flag())
 				continue;
@@ -354,7 +354,7 @@ unsigned int apply_dead_store_elimination(std::list<std::shared_ptr<x86_instruct
 			dead_flags &= ~read_flags;		// and remove read flags
 		}
 
-		for (const auto& writtenRegister : writtenRegs)
+		for (const x86_register& writtenRegister : writtenRegs)
 		{
 			if (writtenRegister.is_flag() || writtenRegister.get_class() == XED_REG_CLASS_IP)
 				continue;
@@ -559,7 +559,45 @@ std::shared_ptr<BasicBlock> make_cfg(AbstractStream& stream, unsigned long long 
 }
 
 
+// variablenode?
+triton::engines::symbolic::SharedSymbolicVariable get_symbolic_var(const triton::ast::SharedAbstractNode &node)
+{
+	return node->getType() == triton::ast::VARIABLE_NODE ? 
+		std::dynamic_pointer_cast<triton::ast::VariableNode>(node)->getSymbolicVariable() : nullptr;
+}
+std::set<triton::ast::SharedAbstractNode> collect_symvars(const triton::ast::SharedAbstractNode &parent)
+{
+	std::set<triton::ast::SharedAbstractNode> result;
+	if (!parent)
+		return result;
 
+	if (parent->getChildren().empty() && parent->isSymbolized())
+	{
+		// this must be variable node right?
+		assert(parent->getType() == triton::ast::VARIABLE_NODE);
+		result.insert(parent);
+	}
+
+	for (const triton::ast::SharedAbstractNode &child : parent->getChildren())
+	{
+		if (!child->getChildren().empty())
+		{
+			// go deep if symbolized
+			if (child->isSymbolized())
+			{
+				auto _new = collect_symvars(child);
+				result.insert(_new.begin(), _new.end());
+			}
+		}
+		else if (child->isSymbolized())
+		{
+			// this must be variable node right?
+			assert(child->getType() == triton::ast::VARIABLE_NODE);
+			result.insert(child);
+		}
+	}
+	return result;
+}
 triton::ast::SharedAbstractNode b(triton::API& ctx, const triton::ast::SharedAbstractNode& node)
 {
 	if (node->getType() == triton::ast::BVXOR_NODE)
@@ -576,7 +614,7 @@ VMProtectAnalyzer::VMProtectAnalyzer(triton::arch::architecture_e arch)
 	triton_api = std::make_shared<triton::API>();
 	triton_api->setArchitecture(arch);
 	triton_api->setMode(triton::modes::ALIGNED_MEMORY, true);
-
+	triton_api->setAstRepresentationMode(triton::ast::representations::PYTHON_REPRESENTATION);
 	this->m_scratch_size = 0;
 	this->m_temp = 0;
 }
@@ -705,6 +743,248 @@ void VMProtectAnalyzer::symbolize_registers()
 	}
 }
 
+const triton::arch::Register& VMProtectAnalyzer::get_source_register(const triton::arch::Instruction &triton_instruction) const
+{
+	if (triton_instruction.getType() == triton::arch::x86::ID_INS_POP)
+	{
+		// idk...
+		return  triton_api->registers.x86_eflags;
+	}
+
+	if (triton_instruction.getType() != triton::arch::x86::ID_INS_MOV)
+	{
+		std::stringstream ss;
+		ss << "memory has written by undefined opcode\n"
+			<< "\t" << triton_instruction << "\"\n"
+			<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
+		throw std::runtime_error(ss.str());
+	}
+
+	// mov MEM,REG
+	const std::vector<triton::arch::OperandWrapper> &operands = triton_instruction.operands;
+	if (operands.size() != 2
+		|| operands[0].getType() != triton::arch::OP_MEM
+		|| operands[1].getType() != triton::arch::OP_REG)
+	{
+		std::stringstream ss;
+		ss << "memory has written by unknown instruction\n"
+			<< "\t" << triton_instruction << "\"\n"
+			<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
+		throw std::runtime_error(ss.str());
+	}
+	return operands[1].getConstRegister();
+}
+const triton::arch::Register& VMProtectAnalyzer::get_dest_register(const triton::arch::Instruction &triton_instruction) const
+{
+	const triton::uint32 instruction_type = triton_instruction.getType();
+	if (instruction_type != triton::arch::x86::ID_INS_MOV
+		&& instruction_type != triton::arch::x86::ID_INS_MOVZX)
+	{
+		std::stringstream ss;
+		ss << "memory has read by undefined opcode\n"
+			<< "\t" << triton_instruction << "\"\n"
+			<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
+		throw std::runtime_error(ss.str());
+	}
+
+	// mov REG,MEM
+	const std::vector<triton::arch::OperandWrapper> &operands = triton_instruction.operands;
+	if (operands.size() != 2
+		|| operands[0].getType() != triton::arch::OP_REG
+		|| operands[1].getType() != triton::arch::OP_MEM)
+	{
+		std::stringstream ss;
+		ss << "memory has read by unknown instruction\n"
+			<< "\t" << triton_instruction << "\"\n"
+			<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
+		throw std::runtime_error(ss.str());
+	}
+	return operands[0].getConstRegister();
+}
+
+bool VMProtectAnalyzer::is_bytecode_address(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context)
+{
+	// return true if lea_ast is constructed by bytecode
+	const std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(lea_ast);
+	if (symvars.empty())
+		return false;
+
+	for (auto it = symvars.begin(); it != symvars.end(); ++it)
+	{
+		const triton::ast::SharedAbstractNode &node = *it;
+		const triton::engines::symbolic::SharedSymbolicVariable &symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(node)->getSymbolicVariable();
+		if (symvar->getId() != context->symvar_bytecode->getId())
+			return false;
+	}
+	return true;
+}
+bool VMProtectAnalyzer::is_stack_address(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context)
+{
+	// return true if lea_ast is constructed by stack
+	const std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(lea_ast);
+	if (symvars.empty())
+		return false;
+
+	for (auto it = symvars.begin(); it != symvars.end(); ++it)
+	{
+		const triton::ast::SharedAbstractNode &node = *it;
+		const triton::engines::symbolic::SharedSymbolicVariable &symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(node)->getSymbolicVariable();
+		if (symvar != context->symvar_stack)
+			return false;
+	}
+	return true;
+}
+bool VMProtectAnalyzer::is_scratch_area_address(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context)
+{
+	// size is hardcoded for now (can see in any push handler perhaps)
+	const triton::uint64 runtime_address = lea_ast->evaluate().convert_to<triton::uint64>();
+	return context->x86_sp <= runtime_address && runtime_address < (context->x86_sp + context->scratch_area_size);
+}
+bool VMProtectAnalyzer::is_fetch_arguments(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context)
+{
+	if (lea_ast->getType() != triton::ast::VARIABLE_NODE)
+		return false;
+
+	const triton::engines::symbolic::SharedSymbolicVariable &symvar =
+		std::dynamic_pointer_cast<triton::ast::VariableNode>(lea_ast)->getSymbolicVariable();
+	return context->arguments.find(symvar->getId()) != context->arguments.end();
+}
+
+bool VMProtectAnalyzer::is_push(VMPHandlerContext *context)
+{
+	// 1 destination (stack)
+	// stack_offset < 0
+	char buf[256];
+	if (context->destinations.size() != 1)
+		return false;
+
+	triton::sint64 stack_offset = this->get_bp() - context->stack;	// needs to be signed
+	if (stack_offset >= 0)
+		return false;
+
+	// <runtime_address, <dest, source>>
+	std::pair<triton::uint64,
+		std::pair<triton::ast::SharedAbstractNode, triton::ast::SharedAbstractNode>> _pair = *context->destinations.begin();
+	const triton::uint64 runtime_address = _pair.first;
+	const triton::ast::SharedAbstractNode& dest = _pair.second.first;
+	const triton::ast::SharedAbstractNode& source = _pair.second.second;
+	if (!this->is_stack_address(dest, context))
+		return false;
+
+	// [stack] = source
+	if (source->isSymbolized())
+	{
+		const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(source, true);
+		const triton::engines::symbolic::SharedSymbolicVariable symvar = get_symbolic_var(simplified);
+		if (symvar && context->vmvars.find(symvar->getId()) != context->vmvars.end())
+		{
+			// push VM_VAR
+			std::cout << "push VM_VAR handler detected" << std::endl;
+
+			// disgusting impl
+			const std::size_t _pos = symvar->getAlias().find("VM_VAR_");
+			if (_pos != std::string::npos)
+			{
+				unsigned long long scratch_offset = std::stoi(symvar->getAlias().substr(_pos + strlen("VM_VAR_")));
+				if (stack_offset == (-8))
+					sprintf_s(buf, 256, "push qword ptr Scratch:[0x%llX]", scratch_offset);
+				else if (stack_offset == (-4))
+					sprintf_s(buf, 256, "push dword ptr Scratch:[0x%llX]", scratch_offset);
+				output_strings.push_back(buf);
+				return true;
+			}
+		}
+		else if (symvar->getId() == context->symvar_stack->getId())
+		{
+			// push stack(ebp)
+			std::cout << "push SP handler detected" << std::endl;
+			output_strings.push_back("push SP");
+			return true;
+		}
+	}
+	else
+	{
+		// push immediate
+		const triton::uint64 immediate = source->evaluate().convert_to<triton::uint64>();
+		if (stack_offset == (-8))
+		{
+			std::cout << "push Qword(" << immediate << ") handler detected" << std::endl;
+			sprintf_s(buf, 256, "push Qword(0x%llX)", immediate);
+			output_strings.push_back(buf);
+		}
+		else if (stack_offset == (-4))
+		{
+			std::cout << "push Dword(" << immediate << ") handler detected" << std::endl;
+			sprintf_s(buf, 256, "push Dword(0x%llX)", immediate);
+			output_strings.push_back(buf);
+		}
+		else if (stack_offset == (-2))
+		{
+			std::cout << "push Word(" << immediate << ") handler detected" << std::endl;
+			sprintf_s(buf, 256, "push Word(0x%llX)", immediate);
+			output_strings.push_back(buf);
+		}
+		else
+		{
+			throw std::runtime_error("invalid stack offset");
+		}
+		return true;
+	}
+	return false;
+}
+bool VMProtectAnalyzer::is_pop(VMPHandlerContext *context)
+{
+	char buf[256];
+	const triton::sint64 stack_offset = this->get_bp() - context->stack;	// needs to be signed
+	if (stack_offset != 2 && stack_offset != 4 && stack_offset != 8)
+		return false;
+
+	// 1 arg, 1 dest(stack), stack_offset>0
+	if (context->arguments.size() != 1 || context->destinations.size() != 1)
+		return false;
+
+	const auto _pair = *context->destinations.begin();
+	const triton::uint64 runtime_address = _pair.first;
+	const triton::ast::SharedAbstractNode& dest = _pair.second.first;
+	const triton::ast::SharedAbstractNode& source = _pair.second.second;
+	if (!this->is_scratch_area_address(dest, context))
+		return false;
+
+	const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(source, true);
+	if (simplified->getType() == triton::ast::VARIABLE_NODE)
+	{
+		const triton::engines::symbolic::SharedSymbolicVariable symvar =
+			std::dynamic_pointer_cast<triton::ast::VariableNode>(simplified)->getSymbolicVariable();
+		if (symvar->getAlias() == "arg0")
+		{
+			if (stack_offset == 8)
+			{
+				std::cout << "pop qword [VM_VAR] handler detected" << std::endl;
+				sprintf_s(buf, 256, "pop qword ptr Scratch:[0x%llX]", runtime_address - context->x86_sp);
+				output_strings.push_back(buf);
+			}
+			else if (stack_offset == 4)
+			{
+				std::cout << "pop dword ptr [VM_VAR] handler detected" << std::endl;
+				sprintf_s(buf, 256, "pop dword ptr Scratch:[0x%llX]", runtime_address - context->x86_sp);
+				output_strings.push_back(buf);
+			}
+			else if (stack_offset == 2)
+			{
+				std::cout << "pop word ptr [VM_VAR] handler detected" << std::endl;
+				sprintf_s(buf, 256, "pop word ptr Scratch:[0x%llX]", runtime_address - context->x86_sp);
+				output_strings.push_back(buf);
+			}
+			else
+			{
+				throw std::runtime_error("invalid stack offset");
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 void VMProtectAnalyzer::load(AbstractStream& stream,
 	unsigned long long module_base, unsigned long long vmp0_address, unsigned long long vmp0_size)
 {
@@ -792,7 +1072,7 @@ void VMProtectAnalyzer::analyze_vm_enter(AbstractStream& stream, unsigned long l
 			continue;
 		}
 
-		if (!instruction->is_branch())
+		if (instruction->get_category() != XED_CATEGORY_UNCOND_BR || instruction->get_branch_displacement_width() == 0)
 		{
 			std::cout << triton_instruction << std::endl;
 		}
@@ -853,7 +1133,7 @@ void VMProtectAnalyzer::analyze_vm_enter(AbstractStream& stream, unsigned long l
 		{
 			char buf[1024];
 			sprintf_s(buf, 1024, "push %s",
-				reinterpret_cast<triton::ast::VariableNode *>(simplified.get())->getSymbolicVariable()->getAlias().c_str());
+				std::dynamic_pointer_cast<triton::ast::VariableNode>(simplified)->getSymbolicVariable()->getAlias().c_str());
 			output_strings.push_back(buf);
 		}
 		else
@@ -889,8 +1169,12 @@ void VMProtectAnalyzer::analyze_vm_handler(AbstractStream& stream, unsigned long
 	// esi = pointer to VM bytecode
 	triton::engines::symbolic::SharedSymbolicVariable symvar_bytecode = triton_api->symbolizeRegister(si_register);
 
+	// x86 stack pointer
+	triton::engines::symbolic::SharedSymbolicVariable symvar_x86_sp = triton_api->symbolizeRegister(sp_register);
+
 	symvar_stack->setAlias("stack");
 	symvar_bytecode->setAlias("bytecode");
+	symvar_x86_sp->setAlias("sp");
 
 	// yo...
 	VMPHandlerContext context;
@@ -901,7 +1185,7 @@ void VMProtectAnalyzer::analyze_vm_handler(AbstractStream& stream, unsigned long
 	context.x86_sp = triton_api->getConcreteRegisterValue(sp_register).convert_to<triton::uint64>();
 	context.symvar_stack = symvar_stack;
 	context.symvar_bytecode = symvar_bytecode;
-	//context.symvar_x86_sp = symvar_x86_sp;
+	context.symvar_x86_sp = symvar_x86_sp;
 
 	std::shared_ptr<BasicBlock> basic_block;
 	auto handler_it = this->m_handlers.find(handler_address);
@@ -938,7 +1222,8 @@ void VMProtectAnalyzer::analyze_vm_handler(AbstractStream& stream, unsigned long
 			continue;
 		}
 
-		if (!xed_instruction->is_branch())
+		if (xed_instruction->get_category() != XED_CATEGORY_UNCOND_BR 
+			|| xed_instruction->get_branch_displacement_width() == 0)
 		{
 			std::cout << "\t" << triton_instruction << std::endl;
 		}
@@ -1104,7 +1389,7 @@ void VMProtectAnalyzer::loadAccess(triton::arch::Instruction &triton_instruction
 		}
 
 		const triton::arch::Register& dest_register = this->get_dest_register(triton_instruction);
-		if (context->is_bytecode_address(lea_ast))
+		if (this->is_bytecode_address(lea_ast, context))
 		{
 			switch (mem.getSize())
 			{
@@ -1124,15 +1409,17 @@ void VMProtectAnalyzer::loadAccess(triton::arch::Instruction &triton_instruction
 				}
 			}
 
-			// symbolize register as bytecode
-			std::string alias = "bytecode-" + std::to_string(mem.getSize());
-			const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-			symvar->setAlias(alias);
-			context->bytecodes.insert(std::make_pair(symvar->getId(), symvar));
-
+			// bytecode can be considered const value
+			if (0)
+			{
+				std::string alias = "bytecode-" + std::to_string(mem.getSize());
+				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
+				symvar->setAlias(alias);
+				context->bytecodes.insert(std::make_pair(symvar->getId(), symvar));
+			}
 			printf("loads %dbytes from bytecode, stores to %s\n", mem.getSize(), dest_register.getName().c_str());
 		}
-		else if (context->is_scratch_area(lea_ast))
+		else if (this->is_scratch_area_address(lea_ast, context))
 		{
 			unsigned long long offset = lea_ast->evaluate().convert_to<unsigned long long>() - context->x86_sp;
 
@@ -1145,54 +1432,52 @@ void VMProtectAnalyzer::loadAccess(triton::arch::Instruction &triton_instruction
 
 			std::cout << dest_register.getName() << "= [x86_sp + 0x" << std::hex << offset << "]" << std::endl;
 		}
-		else if (context->is_stack_address(lea_ast))
+		else if (this->is_stack_address(lea_ast, context))
 		{
-			unsigned long long arg_offset = address - context->stack;
+			const triton::uint64 arg_offset = address - context->stack;
 			if (arg_offset == 0)
 			{
-				printf("loads arg0 to %s\n", dest_register.getName().c_str());
+				printf("%s=arg0(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
 				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
 				symvar->setAlias("arg0");
 				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
 			}
 			else if (arg_offset == 2)
 			{
-				printf("loads arg1 to %s\n", dest_register.getName().c_str());
+				printf("%s=arg1(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
 				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
 				symvar->setAlias("arg1");
 				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
 			}
 			else if (arg_offset == 4)
 			{
-				printf("loads arg1 to %s\n", dest_register.getName().c_str());
+				printf("%s=arg1(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
 				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
 				symvar->setAlias("arg1");
 				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
 			}
 			else if (arg_offset == 8)
 			{
-				printf("loads arg2 to %s\n", dest_register.getName().c_str());
+				printf("%s=arg2(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
 				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
 				symvar->setAlias("arg2");
 				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
 			}
 			else
 			{
-				printf("%016llX\n", arg_offset);
-				throw std::runtime_error("ikdaidfjoajsdofijowesfawef");
+				throw std::runtime_error("invalid arg offset");
 			}
 		}
-		else if (context->is_fetch_arguments(lea_ast))
+		else if (this->is_fetch_arguments(lea_ast, context))
 		{
-			if (mem.getConstSegmentRegister().getId() == triton::arch::ID_REG_INVALID)
+			const triton::arch::Register &segment_register = mem.getConstSegmentRegister();
+			if (segment_register.getId() == triton::arch::ID_REG_INVALID)
 			{
 				// DS?
 			}
 
-			std::string alias = "fetch_" + mem.getConstSegmentRegister().getName() + ":"
-				+ reinterpret_cast<triton::ast::VariableNode *>(lea_ast.get())->getSymbolicVariable()->getAlias();
-			const triton::arch::Register &segment_register = mem.getConstSegmentRegister();
-
+			std::string alias = "fetch_" + segment_register.getName() + ":"
+				+ std::dynamic_pointer_cast<triton::ast::VariableNode>(lea_ast)->getSymbolicVariable()->getAlias();
 			const triton::arch::Register& dest_register = this->get_dest_register(triton_instruction);
 			const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
 			symvar->setAlias(alias);
@@ -1230,17 +1515,17 @@ void VMProtectAnalyzer::storeAccess(triton::arch::Instruction &triton_instructio
 			continue;
 		}
 
-		if (context->is_scratch_area(lea_ast))
+		if (this->is_scratch_area_address(lea_ast, context))
 		{
 			// mov MEM, REG
 			const triton::arch::Register& source_register = this->get_source_register(triton_instruction);
 			const triton::ast::SharedAbstractNode register_ast = triton_api->processSimplification(triton_api->getRegisterAst(source_register), true);
 			context->insert_scratch(lea_ast, register_ast);
 
-			unsigned long long offset = lea_ast->evaluate().convert_to<unsigned long long>() - context->x86_sp;
-			std::cout << "[x86_sp + 0x" << std::hex << offset << "] = " << register_ast << std::endl;
+			const triton::uint64 scratch_offset = lea_ast->evaluate().convert_to<triton::uint64>() - context->x86_sp;
+			std::cout << "[x86_sp + 0x" << std::hex << scratch_offset << "] = " << register_ast << std::endl;
 		}
-		else if (context->is_stack_address(lea_ast))
+		else if (this->is_stack_address(lea_ast, context))
 		{
 			// stores to stack
 			const triton::arch::Register& source_register = this->get_source_register(triton_instruction);
@@ -1248,13 +1533,12 @@ void VMProtectAnalyzer::storeAccess(triton::arch::Instruction &triton_instructio
 			context->insert_scratch(lea_ast, register_ast);
 			std::cout << "[" << lea_ast << "]=" << register_ast << std::endl;
 		}
-		else if (context->is_fetch_arguments(lea_ast))
+		else if (this->is_fetch_arguments(lea_ast, context))
 		{
 			// mov MEM, REG
 			const triton::arch::Register& source_register = this->get_source_register(triton_instruction);
 			const triton::ast::SharedAbstractNode register_ast = triton_api->processSimplification(triton_api->getRegisterAst(source_register), true);
 			context->insert_scratch(lea_ast, register_ast);
-
 			std::cout << "[" << lea_ast << "]=" << register_ast << std::endl;
 		}
 		else
@@ -1269,15 +1553,11 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 	const triton::arch::Register sp_register = this->is_x64() ? triton_api->registers.x86_rsp : triton_api->registers.x86_esp;
 	const triton::arch::Register si_register = this->is_x64() ? triton_api->registers.x86_rsi : triton_api->registers.x86_esi;
 	const triton::uint64 bytecode = triton_api->getConcreteRegisterValue(si_register).convert_to<triton::uint64>();
-	const triton::uint64 sp = triton_api->getConcreteRegisterValue(sp_register).convert_to<triton::uint64>();
-	const triton::uint64 stack = triton_api->getConcreteRegisterValue(rb_register).convert_to<triton::uint64>();
+	const triton::uint64 sp = this->get_sp();
+	const triton::uint64 stack = this->get_bp();
 
 	std::cout << "handlers outputs:" << std::endl;
 	printf("\tbytecode: 0x%016llX -> 0x%016llX\n", context->bytecode, bytecode);
-	if (std::abs(long long(context->bytecode - bytecode)) > 16)
-	{
-		// jmp handler?
-	}
 	printf("\tsp: 0x%016llX -> 0x%016llX\n", context->x86_sp, sp);
 	printf("\tstack: 0x%016llX -> 0x%016llX\n", context->stack, stack);
 	for (const auto &pair : context->destinations)
@@ -1288,7 +1568,21 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 
 	bool handler_detected = false;
 	auto it = context->destinations.begin();
-	if (context->destinations.size() == 0)
+
+	// check if push
+	triton::sint64 stack_offset = stack - context->stack;	// needs to be signed
+	if (this->is_push(context))
+	{
+		handler_detected = true;
+	}
+
+	// check if pop
+	else if (this->is_pop(context))
+	{
+		handler_detected = true;
+	}
+
+	else if (context->destinations.size() == 0)
 	{
 		const triton::ast::SharedAbstractNode simplified_stack_ast =
 			triton_api->processSimplification(triton_api->getRegisterAst(rb_register), true);
@@ -1300,7 +1594,7 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 			triton_api->processSimplification(triton_api->getRegisterAst(si_register), true);
 
 		if (simplified_stack_ast->getType() == triton::ast::VARIABLE_NODE
-			&& reinterpret_cast<triton::ast::VariableNode *>(simplified_stack_ast.get())->getSymbolicVariable()->getAlias() == "arg0")
+			&& std::dynamic_pointer_cast<triton::ast::VariableNode>(simplified_stack_ast)->getSymbolicVariable()->getAlias() == "arg0")
 		{
 			// EBP is loaded from ARG0
 			std::cout << "Store SP handler detected" << std::endl;
@@ -1309,11 +1603,12 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 		}
 		else
 		{
-			std::set<triton::ast::SharedAbstractNode> symvars = context->collect_symvars(simplified_sp_ast);
+			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified_sp_ast);
 			if (symvars.size() == 1)
 			{
-				triton::ast::VariableNode *varnode = reinterpret_cast<triton::ast::VariableNode *>(symvars.begin()->get());
-				if (varnode->getSymbolicVariable()->getId() == context->symvar_stack->getId())
+				const triton::ast::SharedAbstractNode _node = *symvars.begin();
+				const triton::engines::symbolic::SharedSymbolicVariable symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(_node)->getSymbolicVariable();
+				if (symvar->getId() == context->symvar_stack->getId())
 				{
 					// sp = computed by stack
 					analyze_vm_exit(context->address);
@@ -1322,11 +1617,12 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 				}
 			}
 
-			symvars = context->collect_symvars(simplified_bytecode_ast);
+			symvars = collect_symvars(simplified_bytecode_ast);
 			if (symvars.size() == 1)
 			{
-				triton::ast::VariableNode *varnode = reinterpret_cast<triton::ast::VariableNode *>(symvars.begin()->get());
-				if (context->arguments.find(varnode->getSymbolicVariable()->getId()) != context->arguments.end())
+				const triton::ast::SharedAbstractNode _node = *symvars.begin();
+				const triton::engines::symbolic::SharedSymbolicVariable symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(_node)->getSymbolicVariable();
+				if (context->arguments.find(symvar->getId()) != context->arguments.end())
 				{
 					// bytecode can be computed by arg -> Jmp handler perhaps
 					std::cout << "Jmp handler detected" << std::endl;
@@ -1338,136 +1634,16 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 	else if (context->destinations.size() == 1)
 	{
 		const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(it->second.second, true);
-		std::set<triton::ast::SharedAbstractNode> symvars = context->collect_symvars(simplified);
+		std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified);
 
 		// check if push handlers
-		triton::sint64 stack_offset = stack - context->stack;	// needs to be signed
 		const triton::uint64 runtime_address = it->first;
-		if (context->is_result_address(runtime_address) && stack_offset < 0)
-		{
-			// push handlers
-			if (simplified->getType() == triton::ast::VARIABLE_NODE)
-			{
-				triton::ast::VariableNode *varnode = reinterpret_cast<triton::ast::VariableNode *>(simplified.get());
-				if (context->vmvars.find(varnode->getSymbolicVariable()->getId()) != context->vmvars.end())
-				{
-					// push VM_VAR
-					std::cout << "push VM_VAR handler detected" << std::endl;
-					handler_detected = true;
-
-					// disgusting impl
-					auto xd = varnode->getSymbolicVariable()->getAlias().find("VM_VAR_");
-					if (xd != std::string::npos)
-					{
-						unsigned long long vm_var_offset = std::stoi(varnode->getSymbolicVariable()->getAlias().substr(xd + strlen("VM_VAR_")));
-						char buf[256];
-						if (stack_offset == (-8))
-							sprintf_s(buf, 256, "push qdword Scratch:[0x%llX]", vm_var_offset);
-						else if (stack_offset == (-4))
-							sprintf_s(buf, 256, "push dword Scratch:[0x%llX]", vm_var_offset);
-						output_strings.push_back(buf);
-					}
-					else
-					{
-						output_strings.push_back("push DWORD Scratch:[DWORD(idk)]");
-					}
-				}
-				else if (varnode->getSymbolicVariable()->getAlias() == "stack")
-				{
-					// push stack(ebp)
-					std::cout << "push SP handler detected" << std::endl;
-					handler_detected = true;
-
-					// dbg
-					output_strings.push_back("push " + sp_register.getName());
-				}
-			}
-			else if (symvars.size() == 1)
-			{
-				triton::ast::VariableNode *varnode = reinterpret_cast<triton::ast::VariableNode *>(symvars.begin()->get());
-				if (context->bytecodes.find(varnode->getSymbolicVariable()->getId()) != context->bytecodes.end())
-				{
-					// node is constructed by single bytecode, -> it's considered const
-					if (stack_offset == (-8))
-					{
-						const triton::uint64 immediate = simplified->evaluate().convert_to<triton::uint64>();
-						std::cout << "push Qword(" << immediate << ") handler detected" << std::endl;
-						handler_detected = true;
-
-						// dbg
-						char buf[256];
-						sprintf_s(buf, 256, "push Qword(0x%llX)", immediate);
-						output_strings.push_back(buf);
-					}
-					else if (stack_offset == (-4))
-					{
-						const triton::uint64 immediate = simplified->evaluate().convert_to<triton::uint64>();
-						std::cout << "push Dword(" << immediate << ") handler detected" << std::endl;
-						handler_detected = true;
-
-						// dbg
-						char buf[256];
-						sprintf_s(buf, 256, "push Dword(0x%llX)", immediate);
-						output_strings.push_back(buf);
-					}
-					else if (stack_offset == (-2))
-					{
-						const triton::uint64 immediate = simplified->evaluate().convert_to<triton::uint64>();
-						std::cout << "push Word(" << immediate << ") handler detected" << std::endl;
-						handler_detected = true;
-
-						// dbg
-						char buf[256];
-						sprintf_s(buf, 256, "push Word(0x%llX)", immediate);
-						output_strings.push_back(buf);
-					}
-					else
-					{
-						throw std::runtime_error("invalid stack offset");
-					}
-				}
-			}
-
-			if (!handler_detected)
-			{
-				std::cout << "unknown push handler detected" << std::endl;
-			}
-		}
-
 		if (simplified->getType() == triton::ast::VARIABLE_NODE)
 		{
-			triton::ast::VariableNode *varnode = reinterpret_cast<triton::ast::VariableNode *>(simplified.get());
-			if (context->is_scratch_area_address(runtime_address)
-				&& stack_offset == 8
-				&& varnode->getSymbolicVariable()->getAlias() == "arg0")
-			{
-				// POP [VM_VAR]
-				std::cout << "pop qword [VM_VAR] handler detected" << std::endl;
-				handler_detected = true;
-
-				// dbg
-				char buf[256];
-				sprintf_s(buf, 256, "pop qword Scratch:[0x%llX]", it->first - context->x86_sp);
-				output_strings.push_back(buf);
-			}
-
-			else if (context->is_scratch_area_address(runtime_address)
-				&& stack_offset == 4
-				&& varnode->getSymbolicVariable()->getAlias() == "arg0")
-			{
-				// POP [VM_VAR]
-				std::cout << "pop dword ptr [VM_VAR] handler detected" << std::endl;
-				handler_detected = true;
-
-				// dbg
-				char buf[256];
-				sprintf_s(buf, 256, "pop dword Scratch:[0x%llX]", it->first - context->x86_sp);
-				output_strings.push_back(buf);
-			}
-
-			else if (runtime_address == context->stack
+			const triton::engines::symbolic::SharedSymbolicVariable symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(simplified)->getSymbolicVariable();
+			if (runtime_address == context->stack
 				&& context->stack == stack
-				&& varnode->getSymbolicVariable()->getAlias() == "fetch_ss:arg0")	// holy fuck
+				&& symvar->getAlias() == "fetch_ss:arg0")	// holy fuck
 			{
 				// pop t0
 				// push dword ss:[t0]
@@ -1487,7 +1663,7 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 
 			else if (runtime_address == context->stack
 				&& context->stack == stack
-				&& varnode->getSymbolicVariable()->getAlias() == "fetch_unknown:arg0")	// holy fuck
+				&& symvar->getAlias() == "fetch_unknown:arg0")	// holy fuck
 			{
 				// t = pop()
 				// t1 = fetch(t)
@@ -1507,7 +1683,7 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 			}
 			else if (runtime_address == (context->stack + 2)
 				&& context->stack == (stack - 2)
-				&& varnode->getSymbolicVariable()->getAlias() == "fetch_unknown:arg0")
+				&& symvar->getAlias() == "fetch_unknown:arg0")
 			{
 				// pop t0
 				// push word ptr [t0]
@@ -1558,7 +1734,7 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 		for (; it != context->destinations.end(); it++)
 		{
 			const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(it->second.second, true);
-			std::set<triton::ast::SharedAbstractNode> symvars = context->collect_symvars(simplified);
+			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified);
 			if (symvars.size() == 2) // binary operations
 			{
 				// (bvadd arg0 arg1)
@@ -1675,7 +1851,7 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 		for (; it != context->destinations.end(); it++)
 		{
 			const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(it->second.second, true);
-			std::set<triton::ast::SharedAbstractNode> symvars = context->collect_symvars(simplified);
+			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified);
 			if (symvars.size() == 2)
 			{
 				// (bvmul arg1 arg0)

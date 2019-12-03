@@ -31,12 +31,47 @@ enum handler_type
 
 enum
 {
-	vm_segment_cs,
-	vm_segment_ds,
-	vm_segment_ss,
-	vm_segment_fs,
-	vm_segment_gs,
-	vm_segment_scratch,
+	vmp_size_byte,
+	vmp_size_word,
+	vmp_size_dword,
+	vmp_size_qword,
+};
+
+enum vmp_segment
+{
+	vmp_segment_es,
+	vmp_segment_cs,
+	vmp_segment_ss,
+	vmp_segment_ds,
+	vmp_segment_fs,
+	vmp_segment_gs,
+	vmp_segment_scratch
+};
+
+class VMPMemory
+{
+	vmp_segment m_segment;
+};
+
+class VMPRegister
+{
+	//
+};
+
+class VMPExpression
+{
+	// VMPMemory or VMPRegister
+};
+
+class VMP_Push
+{
+	// register or memory or immediate
+	VMPExpression m_expr;
+};
+class VMP_Pop
+{
+	// register or memory
+	VMPExpression m_expr;
 };
 
 class VMHandler

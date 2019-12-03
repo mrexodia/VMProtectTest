@@ -9,7 +9,7 @@ VMHandler::VMHandler()
 }
 VMHandler::~VMHandler()
 {
-
+	triton::engines::symbolic::SharedSymbolicExpression;
 }
 
 unsigned long long VMHandler::compute_next_handler_address(void *context)

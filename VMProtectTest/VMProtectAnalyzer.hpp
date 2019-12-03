@@ -18,113 +18,7 @@ struct VMPHandlerContext
 	// <runtime_address, <dest, source>>
 	std::map<triton::uint64, std::pair<triton::ast::SharedAbstractNode, triton::ast::SharedAbstractNode>> destinations;
 
-
 public:
-	// explore and collect variable_node
-	std::set<triton::ast::SharedAbstractNode> collect_symvars(const triton::ast::SharedAbstractNode &parent)
-	{
-		std::set<triton::ast::SharedAbstractNode> result;
-		if (!parent)
-			return result;
-
-		if (parent->getChildren().empty() && parent->isSymbolized())
-		{
-			// this must be variable node right?
-			assert(parent->getType() == triton::ast::VARIABLE_NODE);
-			result.insert(parent);
-		}
-
-		for (const triton::ast::SharedAbstractNode &child : parent->getChildren())
-		{
-			if (!child->getChildren().empty())
-			{
-				// go deep if symbolized
-				if (child->isSymbolized())
-				{
-					auto _new = collect_symvars(child);
-					result.insert(_new.begin(), _new.end());
-				}
-			}
-			else if (child->isSymbolized())
-			{
-				// this must be variable node right?
-				assert(child->getType() == triton::ast::VARIABLE_NODE);
-				result.insert(child);
-			}
-		}
-		return result;
-	}
-	//
-
-	bool is_bytecode_address(triton::uint64 address) const
-	{
-		// i assume max length is 16
-		return (this->bytecode - 16) <= address && address < (this->bytecode + 16);
-	}
-	bool is_scratch_area_address(triton::uint64 address) const
-	{
-		// size is hardcoded for now (can see in any push handler perhaps)
-		return x86_sp <= address && address < (x86_sp + this->scratch_area_size);
-	}
-	bool is_arguments_address(triton::uint64 address) const
-	{
-		// dont know about bottom, 3args maximum?
-		return stack <= address && address <= (stack + 12);
-	}
-	bool is_result_address(triton::uint64 address) const
-	{
-		// dont know about bottom
-		return (x86_sp + this->scratch_area_size) <= address && address < stack;
-	}
-
-	// check by ast
-	bool is_bytecode_address(const triton::ast::SharedAbstractNode &leaAst)
-	{
-		// bvadd(p-code-1, const)
-		const auto symvars = collect_symvars(leaAst);
-		if (symvars.empty())
-			return false;
-
-		for (auto it = symvars.begin(); it != symvars.end(); ++it)
-		{
-			const triton::ast::SharedAbstractNode &node = *it;
-			const triton::engines::symbolic::SharedSymbolicVariable &symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(node)->getSymbolicVariable();
-			if (symvar->getId() != this->symvar_bytecode->getId())
-				return false;
-		}
-		return true;
-	}
-	bool is_stack_address(const triton::ast::SharedAbstractNode &leaAst)
-	{
-		// bvadd(stack, const) or stack
-		const auto symvars = collect_symvars(leaAst);
-		if (symvars.empty())
-			return false;
-
-		for (auto it = symvars.begin(); it != symvars.end(); ++it)
-		{
-			const triton::ast::SharedAbstractNode &node = *it;
-			const triton::engines::symbolic::SharedSymbolicVariable &symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(node)->getSymbolicVariable();
-			if (symvar != this->symvar_stack)
-				return false;
-		}
-		return true;
-	}
-	bool is_scratch_area(const triton::ast::SharedAbstractNode &leaAst)
-	{
-		// bvadd(DECRYPT(p-code-1), x86_sp) -> scrach area
-		return this->is_scratch_area_address(leaAst->evaluate().convert_to<triton::uint64>());
-	}
-	bool is_fetch_arguments(const triton::ast::SharedAbstractNode &leaAst)
-	{
-		if (leaAst->getType() != triton::ast::VARIABLE_NODE)
-			return false;
-
-		const triton::engines::symbolic::SharedSymbolicVariable &symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(leaAst)->getSymbolicVariable();
-		return this->arguments.find(symvar->getId()) != this->arguments.end();
-	}
-
-	// 
 	void insert_scratch(const triton::ast::SharedAbstractNode &n1, const triton::ast::SharedAbstractNode &n2)
 	{
 		const triton::uint64 runtime_address = n1->evaluate().convert_to<triton::uint64>();
@@ -148,64 +42,18 @@ public:
 	// helpers
 	void symbolize_registers();
 
-	const triton::arch::Register& get_source_register(const triton::arch::Instruction &triton_instruction) const
-	{
-		if (triton_instruction.getType() == triton::arch::x86::ID_INS_POP)
-		{
-			// idk...
-			return  triton_api->registers.x86_eflags;
-		}
+	const triton::arch::Register& get_source_register(const triton::arch::Instruction &triton_instruction) const;
+	const triton::arch::Register& get_dest_register(const triton::arch::Instruction &triton_instruction) const;
 
-		if (triton_instruction.getType() != triton::arch::x86::ID_INS_MOV)
-		{
-			std::stringstream ss;
-			ss << "memory has written by undefined opcode\n"
-				<< "\t" << triton_instruction << "\"\n"
-				<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
-			throw std::runtime_error(ss.str());
-		}
+	// lea ast
+	bool is_bytecode_address(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context);
+	bool is_stack_address(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context);
+	bool is_scratch_area_address(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context);
+	bool is_fetch_arguments(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context);
 
-		// mov MEM,REG
-		const std::vector<triton::arch::OperandWrapper> &operands = triton_instruction.operands;
-		if (operands.size() != 2
-			|| operands[0].getType() != triton::arch::OP_MEM
-			|| operands[1].getType() != triton::arch::OP_REG)
-		{
-			std::stringstream ss;
-			ss << "memory has written by unknown instruction\n"
-				<< "\t" << triton_instruction << "\"\n"
-				<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
-			throw std::runtime_error(ss.str());
-		}
-		return operands[1].getConstRegister();
-	}
-	const triton::arch::Register& get_dest_register(const triton::arch::Instruction &triton_instruction) const
-	{
-		const triton::uint32 instruction_type = triton_instruction.getType();
-		if (instruction_type != triton::arch::x86::ID_INS_MOV
-			&& instruction_type != triton::arch::x86::ID_INS_MOVZX)
-		{
-			std::stringstream ss;
-			ss << "memory has read by undefined opcode\n"
-				<< "\t" << triton_instruction << "\"\n"
-				<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
-			throw std::runtime_error(ss.str());
-		}
-
-		// mov REG,MEM
-		const std::vector<triton::arch::OperandWrapper> &operands = triton_instruction.operands;
-		if (operands.size() != 2
-			|| operands[0].getType() != triton::arch::OP_REG
-			|| operands[1].getType() != triton::arch::OP_MEM)
-		{
-			std::stringstream ss;
-			ss << "memory has read by unknown instruction\n"
-				<< "\t" << triton_instruction << "\"\n"
-				<< "\tFile: " << __FILE__ << ", L: " << __LINE__;
-			throw std::runtime_error(ss.str());
-		}
-		return operands[0].getConstRegister();
-	}
+	//
+	bool is_push(VMPHandlerContext *context);
+	bool is_pop(VMPHandlerContext *context);
 
 	// work-sub
 	void loadAccess(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context);

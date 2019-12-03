@@ -89,10 +89,7 @@ public:
 	x86_register get_gpr64() const;		// rax, rcx, rdx, rbx
 
 	// flag
-	bool is_flag() const
-	{
-		return XED_REG_FLAGS_FIRST <= this->m_xed_reg && this->m_xed_reg <= XED_REG_RFLAGS;
-	}
+	bool is_flag() const;
 
 private:
 	xed_reg_enum_t m_xed_reg;
