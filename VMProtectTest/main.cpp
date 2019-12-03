@@ -113,8 +113,8 @@ void test_v1()
 
 	VMProtectAnalyzer analyzer;
 	analyzer.load(stream, 0x00400000, 0x17000, 0x86CB0);
-	analyzer.analyze_vm_enter(stream, 0x0040C890);
-	//analyzer.analyze_vm_enter(stream, 0x004312D7);
+	//analyzer.analyze_vm_enter(stream, 0x0040C890);
+	analyzer.analyze_vm_enter(stream, 0x004312D7);
 	//analyzer.analyze_vm_enter(stream, 0x0041F618);
 	//analyzer.analyze_vm_enter(stream, 0x00477CBB);
 

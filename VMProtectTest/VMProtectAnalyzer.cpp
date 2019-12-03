@@ -614,7 +614,7 @@ VMProtectAnalyzer::VMProtectAnalyzer(triton::arch::architecture_e arch)
 	triton_api = std::make_shared<triton::API>();
 	triton_api->setArchitecture(arch);
 	triton_api->setMode(triton::modes::ALIGNED_MEMORY, true);
-	triton_api->setAstRepresentationMode(triton::ast::representations::PYTHON_REPRESENTATION);
+	//triton_api->setAstRepresentationMode(triton::ast::representations::PYTHON_REPRESENTATION);
 	this->m_scratch_size = 0;
 	this->m_temp = 0;
 }
@@ -787,7 +787,7 @@ const triton::arch::Register& VMProtectAnalyzer::get_dest_register(const triton:
 		throw std::runtime_error(ss.str());
 	}
 
-	// mov REG,MEM
+	// [mov|movzx] REG,MEM
 	const std::vector<triton::arch::OperandWrapper> &operands = triton_instruction.operands;
 	if (operands.size() != 2
 		|| operands[0].getType() != triton::arch::OP_REG
@@ -876,30 +876,33 @@ bool VMProtectAnalyzer::is_push(VMPHandlerContext *context)
 	{
 		const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(source, true);
 		const triton::engines::symbolic::SharedSymbolicVariable symvar = get_symbolic_var(simplified);
-		if (symvar && context->vmvars.find(symvar->getId()) != context->vmvars.end())
+		if (symvar)
 		{
-			// push VM_VAR
-			std::cout << "push VM_VAR handler detected" << std::endl;
-
-			// disgusting impl
-			const std::size_t _pos = symvar->getAlias().find("VM_VAR_");
-			if (_pos != std::string::npos)
+			if (context->vmvars.find(symvar->getId()) != context->vmvars.end())
 			{
-				unsigned long long scratch_offset = std::stoi(symvar->getAlias().substr(_pos + strlen("VM_VAR_")));
-				if (stack_offset == (-8))
-					sprintf_s(buf, 256, "push qword ptr Scratch:[0x%llX]", scratch_offset);
-				else if (stack_offset == (-4))
-					sprintf_s(buf, 256, "push dword ptr Scratch:[0x%llX]", scratch_offset);
-				output_strings.push_back(buf);
+				// push VM_VAR
+				std::cout << "push VM_VAR handler detected" << std::endl;
+
+				// disgusting impl
+				const std::size_t _pos = symvar->getAlias().find("VM_VAR_");
+				if (_pos != std::string::npos)
+				{
+					unsigned long long scratch_offset = std::stoi(symvar->getAlias().substr(_pos + strlen("VM_VAR_")));
+					if (stack_offset == (-8))
+						sprintf_s(buf, 256, "push qword ptr Scratch:[0x%llX]", scratch_offset);
+					else if (stack_offset == (-4))
+						sprintf_s(buf, 256, "push dword ptr Scratch:[0x%llX]", scratch_offset);
+					output_strings.push_back(buf);
+					return true;
+				}
+			}
+			else if (symvar->getId() == context->symvar_stack->getId())
+			{
+				// push stack(ebp)
+				std::cout << "push SP handler detected" << std::endl;
+				output_strings.push_back("push SP");
 				return true;
 			}
-		}
-		else if (symvar->getId() == context->symvar_stack->getId())
-		{
-			// push stack(ebp)
-			std::cout << "push SP handler detected" << std::endl;
-			output_strings.push_back("push SP");
-			return true;
 		}
 	}
 	else
@@ -1417,7 +1420,7 @@ void VMProtectAnalyzer::loadAccess(triton::arch::Instruction &triton_instruction
 				symvar->setAlias(alias);
 				context->bytecodes.insert(std::make_pair(symvar->getId(), symvar));
 			}
-			printf("loads %dbytes from bytecode, stores to %s\n", mem.getSize(), dest_register.getName().c_str());
+			printf("%s=bytecode(%d)\n", dest_register.getName().c_str(), mem.getSize());
 		}
 		else if (this->is_scratch_area_address(lea_ast, context))
 		{
@@ -1733,15 +1736,15 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 	{
 		for (; it != context->destinations.end(); it++)
 		{
-			const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(it->second.second, true);
-			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified);
+			const triton::ast::SharedAbstractNode simplified_source = triton_api->processSimplification(it->second.second, true);
+			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified_source);
 			if (symvars.size() == 2) // binary operations
 			{
-				// (bvadd arg0 arg1)
-				if (simplified->getType() == triton::ast::BVADD_NODE)
+				// a, b = BINOP(OP_0, OP_1)
+				if (simplified_source->getType() == triton::ast::BVADD_NODE)
 				{
 					// add handler right?
-					std::vector<triton::ast::SharedAbstractNode>& add_children = simplified->getChildren();
+					std::vector<triton::ast::SharedAbstractNode>& add_children = simplified_source->getChildren();
 					if (add_children.size() == 2
 						&& add_children[0]->getType() == triton::ast::VARIABLE_NODE
 						&& add_children[1]->getType() == triton::ast::VARIABLE_NODE)
@@ -1777,8 +1780,16 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 						output_strings.push_back(buf);
 					}
 				}
-				else if (simplified->getType() == triton::ast::BVLSHR_NODE)
+				else if (simplified_source->getType() == triton::ast::BVLSHR_NODE)
 				{
+					/*
+					auto symvars_it = symvars.begin();
+					auto _left_node = *symvars_it;
+					symvars_it++;
+					auto _right_node = *symvars_it;
+					printf("SHR(%d, %d)\n", _left_node->getBitvectorSize(), _right_node->getBitvectorSize());
+					*/
+
 					// (bvlshr arg0 (concat (_ bv0 1B) ((_ extract 4 0) arg1)))
 					std::cout << "SHR handler detected" << std::endl;
 					handler_detected = true;
@@ -1810,7 +1821,7 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 					sprintf_s(buf, 256, "push flags %s", t2.c_str());
 					output_strings.push_back(buf);
 				}
-				else if (simplified->getType() == triton::ast::BVNOT_NODE)
+				else if (simplified_source->getType() == triton::ast::BVNOT_NODE)
 				{
 					// (bvnot (bvor arg0 arg1))
 					std::cout << "NOR handler detected" << std::endl;
@@ -1857,18 +1868,39 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 				// (bvmul arg1 arg0)
 				if (simplified->getType() == triton::ast::BVMUL_NODE)
 				{
-					// add handler right?
-					std::vector<triton::ast::SharedAbstractNode>& add_children = simplified->getChildren();
-					if (add_children.size() == 2
-						&& add_children[0]->getType() == triton::ast::VARIABLE_NODE
-						&& add_children[1]->getType() == triton::ast::VARIABLE_NODE)
+					std::vector<triton::ast::SharedAbstractNode>& mul_children = simplified->getChildren();
+					if (mul_children.size() == 2
+						&& mul_children[0]->getType() == triton::ast::VARIABLE_NODE
+						&& mul_children[1]->getType() == triton::ast::VARIABLE_NODE)
 					{
 						std::cout << "(MUL/IMUL) handler detected" << std::endl;
 						handler_detected = true;
 
 						// dbg
 						char buf[256];
-						sprintf_s(buf, 256, "mul/imul(x, y)");
+						std::string t0 = "t" + std::to_string(++this->m_temp);
+						std::string t1 = "t" + std::to_string(++this->m_temp);
+						std::string t2 = "t" + std::to_string(++this->m_temp);
+						std::string t3 = "t" + std::to_string(++this->m_temp);
+						std::string t4 = "t" + std::to_string(++this->m_temp);
+
+						// pop, pop, mul, push, push, push
+						sprintf_s(buf, 256, "pop %s", t0.c_str());
+						output_strings.push_back(buf);
+
+						sprintf_s(buf, 256, "pop %s", t1.c_str());
+						output_strings.push_back(buf);
+
+						sprintf_s(buf, 256, "%s, %s, %s = MUL/IMUL(%s, %s)", 
+							t2.c_str(), t3.c_str(), t4.c_str(), t0.c_str(), t1.c_str());
+						output_strings.push_back(buf);
+
+						// push eax, edx, flags
+						sprintf_s(buf, 256, "push %s(eax)", t2.c_str());
+						output_strings.push_back(buf);
+						sprintf_s(buf, 256, "push %s(edx)", t3.c_str());
+						output_strings.push_back(buf);
+						sprintf_s(buf, 256, "push %s(flags)", t4.c_str());
 						output_strings.push_back(buf);
 					}
 				}
