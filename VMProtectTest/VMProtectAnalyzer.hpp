@@ -4,6 +4,12 @@
 
 struct BasicBlock;
 
+namespace IR
+{
+	class Expression;
+	class Statement;
+}
+
 struct VMPHandlerContext
 {
 	// before start
@@ -13,17 +19,11 @@ struct VMPHandlerContext
 	triton::engines::symbolic::SharedSymbolicVariable symvar_stack, symvar_bytecode, symvar_x86_sp;
 
 	// load
-	std::map<triton::usize, triton::engines::symbolic::SharedSymbolicVariable> bytecodes, vmvars, arguments, fetched;
+	std::map<triton::usize, triton::engines::symbolic::SharedSymbolicVariable> scratch_variables, arguments;
 
-	// <runtime_address, <dest, source>>
-	std::map<triton::uint64, std::pair<triton::ast::SharedAbstractNode, triton::ast::SharedAbstractNode>> destinations;
-
-public:
-	void insert_scratch(const triton::ast::SharedAbstractNode &n1, const triton::ast::SharedAbstractNode &n2)
-	{
-		const triton::uint64 runtime_address = n1->evaluate().convert_to<triton::uint64>();
-		this->destinations[runtime_address] = std::make_pair(n1, n2);
-	}
+	// expressions
+	std::list<std::shared_ptr<IR::Statement>> m_statements;
+	std::map<triton::usize, std::shared_ptr<IR::Expression>> m_expression_map; // associate symbolic variable with IR::Expression
 };
 
 class VMProtectAnalyzer
@@ -34,6 +34,10 @@ public:
 
 	//
 	bool is_x64() const;
+
+	triton::arch::Register get_bp_register() const;
+	triton::arch::Register get_sp_register() const;
+	triton::arch::Register get_ip_register() const;
 
 	triton::uint64 get_bp() const;
 	triton::uint64 get_sp() const;
@@ -51,19 +55,22 @@ public:
 	bool is_scratch_area_address(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context);
 	bool is_fetch_arguments(const triton::ast::SharedAbstractNode &lea_ast, VMPHandlerContext *context);
 
-	//
-	bool is_push(VMPHandlerContext *context);
-	bool is_pop(VMPHandlerContext *context);
-
 	// work-sub
-	void loadAccess(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context);
-	void storeAccess(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context);
 	void categorize_handler(VMPHandlerContext *context);
 
 	// work
 	void load(AbstractStream& stream,
 		unsigned long long module_base, unsigned long long vmp0_address, unsigned long long vmp0_size);
+
+	// vm-enter
 	void analyze_vm_enter(AbstractStream& stream, unsigned long long address);
+
+	// vm-handler
+	void symbolize_memory(const triton::arch::MemoryAccess& mem, VMPHandlerContext *context);
+	std::vector<std::shared_ptr<IR::Expression>> save_expressions(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context);
+	void check_arity_operation(triton::arch::Instruction &triton_instruction, const std::vector<std::shared_ptr<IR::Expression>> &operands_expressions, VMPHandlerContext *context);
+	void check_store_access(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context);
+
 	void analyze_vm_handler(AbstractStream& stream, unsigned long long handler_address);
 	void analyze_vm_exit(unsigned long long handler_address);
 
@@ -83,6 +90,5 @@ private:
 	unsigned long long m_scratch_size;
 
 	// runtimeshit
-	int m_temp;
 	std::map<triton::uint64, std::shared_ptr<BasicBlock>> m_handlers;
 };

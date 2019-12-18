@@ -3,481 +3,8 @@
 #include "VMProtectAnalyzer.hpp"
 #include "x86_instruction.hpp"
 #include "AbstractStream.hpp"
-
-// structures
-struct BasicBlock
-{
-	// first instruction that starts basic block
-	unsigned long long leader;
-
-	std::list<std::shared_ptr<x86_instruction>> instructions;
-
-	// when last instruction can't follow
-	bool terminator;
-
-	// dead registers when it enters basic block
-	std::map<x86_register, bool> dead_registers;
-	xed_uint32_t dead_flags;
-
-	std::shared_ptr<BasicBlock> next_basic_block, target_basic_block;
-};
-
-bool modifiesIP(const std::shared_ptr<x86_instruction>& instruction)
-{
-	for (const x86_register& reg : instruction->get_written_registers())
-	{
-		if (reg.get_largest_enclosing_register() == XED_REG_RIP)
-			return true;
-	}
-	return false;
-}
-bool isCall0(const std::shared_ptr<x86_instruction>& instruction)
-{
-	static xed_uint8_t s_bytes[5] = { 0xE8, 0x00, 0x00, 0x00, 0x00 };
-	const auto bytes = instruction->get_bytes();
-	if (bytes.size() != 5)
-		return false;
-
-	for (int i = 0; i < 5; i++)
-	{
-		if (s_bytes[i] != bytes[i])
-			return false;
-	}
-	return true;
-}
-
-// CFG
-void identify_leaders_sub(AbstractStream& stream, unsigned long long leader,
-	std::set<unsigned long long>& leaders, std::list<std::pair<unsigned long long, unsigned long long>>& visit)
-{
-	// The first instruction is a leader.
-	leaders.insert(leader);
-
-	// visit<start, end(include)>
-	auto is_visit = [&visit](unsigned long long address) -> bool
-	{
-		for (const auto &pair : visit)
-		{
-			if (pair.first <= address && address <= pair.second)
-			{
-				// already visited
-				return true;
-			}
-		}
-		return false;
-	};
-
-	// read one instruction
-	unsigned long long addr = leader;
-	while (!is_visit(addr))
-	{
-		stream.seek(addr);
-		const std::shared_ptr<x86_instruction> instr = stream.readNext();
-		if (!modifiesIP(instr))
-		{
-			// read next instruction
-			addr = instr->get_addr() + instr->get_length();
-			continue;
-		}
-
-		// leader -> addr
-		visit.push_back(std::make_pair<>(leader, addr));
-
-		switch (instr->get_category())
-		{
-			case XED_CATEGORY_COND_BR:		// conditional branch
-			{
-				// The target of a conditional or an unconditional goto/jump instruction is a leader.
-				const unsigned long long target = instr->get_addr() + instr->get_length() + instr->get_branch_displacement();
-				identify_leaders_sub(stream, target, leaders, visit);
-
-				// The instruction that immediately follows a conditional or an unconditional goto/jump instruction is a leader.
-				identify_leaders_sub(stream, instr->get_addr() + instr->get_length(), leaders, visit);
-				break;
-			}
-			case XED_CATEGORY_UNCOND_BR:	// unconditional branch
-			{
-				xed_uint_t width = instr->get_branch_displacement_width();
-				if (width == 0)
-				{
-					std::cout << "basic block ends with indirect unconditional branch" << std::endl;
-					return;
-				}
-
-				// The target of a conditional or an unconditional goto/jump instruction is a leader.
-				const unsigned long long target = instr->get_addr() + instr->get_length() + instr->get_branch_displacement();
-				identify_leaders_sub(stream, target, leaders, visit);
-				break;
-			}
-			case XED_CATEGORY_CALL:
-			{
-				// uh.
-				if (isCall0(instr))
-				{
-					// call +5 is not leader or some shit
-					addr = instr->get_addr() + instr->get_length();
-					continue;
-				}
-				else
-				{
-					// call is considered as unconditional jump for VMP
-					const unsigned long long target = instr->get_addr() + instr->get_length() + instr->get_branch_displacement();
-					identify_leaders_sub(stream, target, leaders, visit);
-				}
-				break;
-			}
-			case XED_CATEGORY_RET:
-			{
-				std::cout << "basic block ends with ret" << std::endl;
-				break;
-			}
-			default:
-			{
-				std::cout << std::hex << instr->get_addr() << ": " << instr->get_string() << std::endl;
-				throw std::runtime_error("undefined EIP modify instruction");
-			}
-		}
-
-		// done i guess
-		return;
-	}
-}
-void identify_leaders(AbstractStream& stream, unsigned long long leader, std::set<unsigned long long>& leaders)
-{
-	std::list<std::pair<unsigned long long, unsigned long long>> visit;
-	identify_leaders_sub(stream, leader, leaders, visit);
-}
-std::shared_ptr<BasicBlock> make_basic_blocks(AbstractStream& stream, unsigned long long address,
-	const std::set<unsigned long long>& leaders, std::map<unsigned long long, std::shared_ptr<BasicBlock>>& basic_blocks)
-{
-	// return basic block if it exists
-	auto it = basic_blocks.find(address);
-	if (it != basic_blocks.end())
-		return it->second;
-
-	// make basic block
-	std::shared_ptr<BasicBlock> current_basic_block = std::make_shared<BasicBlock>();
-	current_basic_block->leader = address;
-	current_basic_block->terminator = false;
-	current_basic_block->dead_flags = 0;
-	basic_blocks.insert(std::make_pair(address, current_basic_block));
-
-	// and seek
-	stream.seek(address);
-	for (;;)
-	{
-		const std::shared_ptr<x86_instruction> instruction = stream.readNext();
-		unsigned long long next_address = instruction->get_addr();
-		if (!current_basic_block->instructions.empty() && leaders.count(next_address) > 0)
-		{
-			// make basic block with a leader
-			current_basic_block->next_basic_block = make_basic_blocks(stream, next_address, leaders, basic_blocks);
-			goto return_basic_block;
-		}
-
-		current_basic_block->instructions.push_back(instruction);
-		switch (instruction->get_category())
-		{
-			case XED_CATEGORY_COND_BR:		// conditional branch
-			{
-				// follow jump
-				const unsigned long long target_address = instruction->get_addr() + instruction->get_length() + instruction->get_branch_displacement();
-				if (leaders.count(target_address) <= 0)
-				{
-					// should be "identify_leaders" bug
-					throw std::runtime_error("conditional branch target is somehow not leader.");
-				}
-
-				current_basic_block->target_basic_block = make_basic_blocks(stream, target_address, leaders, basic_blocks);
-				current_basic_block->next_basic_block = make_basic_blocks(stream, instruction->get_addr() + instruction->get_length(), leaders, basic_blocks);
-				goto return_basic_block;
-			}
-			case XED_CATEGORY_UNCOND_BR:	// unconditional branch
-			{
-				xed_uint_t width = instruction->get_branch_displacement_width();
-				if (width == 0)
-				{
-					current_basic_block->terminator = true;
-					return current_basic_block;
-				}
-
-				// follow unconditional branch (target should be leader)
-				const unsigned long long target_address = instruction->get_addr() + instruction->get_length() + instruction->get_branch_displacement();
-				if (leaders.count(target_address) <= 0)
-				{
-					// should be "identify_leaders" bug
-					throw std::runtime_error("unconditional branch target is somehow not leader.");
-				}
-
-				current_basic_block->target_basic_block = make_basic_blocks(stream, target_address, leaders, basic_blocks);
-				goto return_basic_block;
-			}
-			case XED_CATEGORY_CALL:
-			{
-				if (isCall0(instruction))
-				{
-					// call +5 is not leader or some shit
-					break;
-				}
-				else
-				{
-					// follow call
-					const unsigned long long target_address = instruction->get_addr() + instruction->get_length() + instruction->get_branch_displacement();
-					if (leaders.count(target_address) <= 0)
-					{
-						// should be "identify_leaders" bug
-						throw std::runtime_error("call's target is somehow not leader.");
-					}
-
-					current_basic_block->target_basic_block = make_basic_blocks(stream, target_address, leaders, basic_blocks);
-					goto return_basic_block;
-				}
-			}
-			case XED_CATEGORY_RET:			// or return
-			{
-				current_basic_block->terminator = true;
-				goto return_basic_block;
-			}
-			default:
-			{
-				break;
-			}
-		}
-	}
-
-return_basic_block:
-	return current_basic_block;
-}
-
-// optimizations
-unsigned int apply_dead_store_elimination(std::list<std::shared_ptr<x86_instruction>>& instructions,
-	std::map<x86_register, bool>& dead_registers, xed_uint32_t& dead_flags)
-{
-	unsigned int removed_bytes = 0;
-	for (auto it = instructions.rbegin(); it != instructions.rend();)
-	{
-		const std::shared_ptr<x86_instruction> instr = *it;
-		bool canRemove = true;
-		std::vector<x86_register> readRegs, writtenRegs;
-		xed_uint32_t read_flags = 0, written_flags = 0, alive_flags = ~dead_flags;
-		instr->get_read_written_registers(&readRegs, &writtenRegs);
-
-		// do not remove last? xd
-		if (it == instructions.rbegin())
-		{
-			//goto update_dead_registers;
-		}
-
-		// check flags
-		if (instr->uses_rflags())
-		{
-			read_flags = instr->get_read_flag_set()->flat;
-			written_flags = instr->get_written_flag_set()->flat;
-			if (alive_flags & written_flags)
-			{
-				// alive_flags being written by the instruction thus can't remove right?
-				goto update_dead_registers;
-			}
-		}
-
-		// check registers
-		for (const x86_register& writtenRegister : writtenRegs)
-		{
-			if (writtenRegister.is_flag())
-				continue;
-
-			std::vector<x86_register> checks;
-			if (writtenRegister.get_gpr_class() == XED_REG_CLASS_GPR64)
-			{
-				checks.push_back(writtenRegister.get_gpr8_low());
-				checks.push_back(writtenRegister.get_gpr8_high());
-				checks.push_back(writtenRegister.get_gpr16());
-				checks.push_back(writtenRegister.get_gpr32());
-			}
-			else if (writtenRegister.get_gpr_class() == XED_REG_CLASS_GPR32)
-			{
-				checks.push_back(writtenRegister.get_gpr8_low());
-				checks.push_back(writtenRegister.get_gpr8_high());
-				checks.push_back(writtenRegister.get_gpr16());
-			}
-			else if (writtenRegister.get_gpr_class() == XED_REG_CLASS_GPR16)
-			{
-				checks.push_back(writtenRegister.get_gpr8_low());
-				checks.push_back(writtenRegister.get_gpr8_high());
-			}
-			checks.push_back(writtenRegister);
-
-			for (const auto& check : checks)
-			{
-				if (!check.is_valid())
-					continue;
-
-				auto pair = dead_registers.find(check);
-				if (pair == dead_registers.end() || !pair->second)
-				{
-					// Ž€‚ñ‚¾ƒŒƒWƒXƒ^‚Ìê‡‚Í‘±‚¯‚é
-					goto update_dead_registers;
-				}
-			}
-		}
-
-		// check memory operand
-		for (xed_uint_t j = 0, memops = instr->get_number_of_memory_operands(); j < memops; j++)
-		{
-			if (instr->is_mem_written(j))
-			{
-				// ƒƒ‚ƒŠ‚Ö‚Ì‘‚«ž‚Ý‚ª‚ ‚éê‡‚ÍÁ‚³‚È‚¢
-				canRemove = false;
-				break;
-			}
-		}
-
-		// íœ‚·‚é
-		if (canRemove)
-		{
-			removed_bytes += instr->get_length();
-			//printf("remove ");
-			//instr->print();
-
-			// REMOVE NOW
-			instructions.erase(--(it.base()));
-			continue;
-		}
-
-		// update dead registers
-	update_dead_registers:
-
-		// check flags
-		if (instr->uses_rflags())
-		{
-			dead_flags |= written_flags;	// add written flags
-			dead_flags &= ~read_flags;		// and remove read flags
-		}
-
-		for (const x86_register& writtenRegister : writtenRegs)
-		{
-			if (writtenRegister.is_flag() || writtenRegister.get_class() == XED_REG_CLASS_IP)
-				continue;
-
-			if (writtenRegister.get_gpr_class() == XED_REG_CLASS_GPR64)
-			{
-				dead_registers[writtenRegister.get_gpr8_low()] = true;
-				dead_registers[writtenRegister.get_gpr8_high()] = true;
-				dead_registers[writtenRegister.get_gpr16()] = true;
-				dead_registers[writtenRegister.get_gpr32()] = true;
-			}
-			else if (writtenRegister.get_gpr_class() == XED_REG_CLASS_GPR32)
-			{
-				dead_registers[writtenRegister.get_gpr8_low()] = true;
-				dead_registers[writtenRegister.get_gpr8_high()] = true;
-				dead_registers[writtenRegister.get_gpr16()] = true;
-			}
-			else if (writtenRegister.get_gpr_class() == XED_REG_CLASS_GPR16)
-			{
-				dead_registers[writtenRegister.get_gpr8_low()] = true;
-				dead_registers[writtenRegister.get_gpr8_high()] = true;
-			}
-			dead_registers[writtenRegister] = true;
-		}
-		for (const x86_register& readRegister : readRegs)
-		{
-			if (readRegister.is_flag() || readRegister.get_class() == XED_REG_CLASS_IP)
-				continue;
-
-			if (readRegister.get_gpr_class() == XED_REG_CLASS_GPR64)
-			{
-				dead_registers[readRegister.get_gpr8_low()] = false;
-				dead_registers[readRegister.get_gpr8_high()] = false;
-				dead_registers[readRegister.get_gpr16()] = false;
-				dead_registers[readRegister.get_gpr32()] = false;
-			}
-			else if (readRegister.get_gpr_class() == XED_REG_CLASS_GPR32)
-			{
-				dead_registers[readRegister.get_gpr8_low()] = false;
-				dead_registers[readRegister.get_gpr8_high()] = false;
-				dead_registers[readRegister.get_gpr16()] = false;
-			}
-			else if (readRegister.get_gpr_class() == XED_REG_CLASS_GPR16)
-			{
-				dead_registers[readRegister.get_gpr8_low()] = false;
-				dead_registers[readRegister.get_gpr8_high()] = false;
-			}
-			dead_registers[readRegister] = false;
-		}
-
-		++it;
-	}
-
-	return removed_bytes;
-}
-unsigned int deobfuscate_basic_block(std::shared_ptr<BasicBlock>& basic_block)
-{
-	// all registers / memories should be considered 'ALIVE' when it enters basic block or when it leaves basic block
-	std::map<x86_register, bool> dead_registers;
-	xed_uint32_t dead_flags = 0;
-	if (basic_block->terminator)
-	{
-		// for vmp handlers
-		std::vector<x86_register> dead_ = 
-		{
-			XED_REG_RAX, XED_REG_RCX, XED_REG_RDX
-		};
-		for (int i = 0; i < 3; i++)
-		{
-			const x86_register &reg = dead_[i];
-			dead_registers[reg.get_gpr8_low()] = true;
-			dead_registers[reg.get_gpr8_high()] = true;
-			dead_registers[reg.get_gpr16()] = true;
-			dead_registers[reg.get_gpr32()] = true;
-			dead_registers[reg] = true;
-		}
-
-		// all flags must be dead
-		dead_flags = 0xFFFFFFFF;
-	}
-	else
-	{
-		// if dead in both :)
-		if (basic_block->next_basic_block && basic_block->target_basic_block)
-		{
-			const std::map<x86_register, bool>& dead_registers1 = basic_block->next_basic_block->dead_registers;
-			const std::map<x86_register, bool>& dead_registers2 = basic_block->target_basic_block->dead_registers;
-			for (const auto& pair : dead_registers1)
-			{
-				const x86_register& dead_reg = pair.first;
-				if (!pair.second)
-					continue;
-
-				auto it = dead_registers2.find(dead_reg);
-				if (it != dead_registers2.end() && it->second)
-					dead_registers.insert(std::make_pair(dead_reg, true));
-			}
-
-			const xed_uint32_t dead_flags1 = basic_block->next_basic_block->dead_flags;
-			const xed_uint32_t dead_flags2 = basic_block->target_basic_block->dead_flags;
-			dead_flags = dead_flags1 & dead_flags2;
-		}
-		else if (basic_block->next_basic_block)
-		{
-			dead_registers = basic_block->next_basic_block->dead_registers;
-			dead_flags = basic_block->next_basic_block->dead_flags;
-		}
-		else if (basic_block->target_basic_block)
-		{
-			dead_registers = basic_block->target_basic_block->dead_registers;
-			dead_flags = basic_block->target_basic_block->dead_flags;
-		}
-		else
-		{
-			throw std::runtime_error("?");
-		}
-	}
-
-	unsigned int removed_bytes = apply_dead_store_elimination(basic_block->instructions, dead_registers, dead_flags);
-	basic_block->dead_registers = dead_registers;
-	basic_block->dead_flags = dead_flags;
-	return removed_bytes;
-}
+#include "CFG.hpp"
+#include "IR.hpp"
 
 // helper?
 void print_basic_blocks(const std::shared_ptr<BasicBlock> &first_basic_block)
@@ -522,43 +49,6 @@ void print_basic_blocks(const std::shared_ptr<BasicBlock> &first_basic_block)
 	}
 }
 
-std::shared_ptr<BasicBlock> make_cfg(AbstractStream& stream, unsigned long long address)
-{
-	// identify leaders
-	std::set<unsigned long long> leaders;
-	identify_leaders(stream, address, leaders);
-
-	// make basic blocks
-	std::map<unsigned long long, std::shared_ptr<BasicBlock>> basic_blocks;
-	std::shared_ptr<BasicBlock> first_basic_block = make_basic_blocks(stream, address, leaders, basic_blocks);
-
-	// deobfuscate
-	constexpr bool _deobfuscate = 1;
-	if (_deobfuscate)
-	{
-		// can possibly improve by checking dead_registers/flags after deobfuscate
-		unsigned int removed_bytes;
-		do
-		{
-			removed_bytes = 0;
-			for (auto& pair : basic_blocks)
-				removed_bytes += deobfuscate_basic_block(pair.second);
-		}
-		while (removed_bytes);
-	}
-
-	// print them
-	constexpr bool _print = 0;
-	if (_print)
-	{
-		std::cout << std::endl;
-		print_basic_blocks(first_basic_block);
-		std::cout << std::endl;
-	}
-	return first_basic_block;
-}
-
-
 // variablenode?
 triton::engines::symbolic::SharedSymbolicVariable get_symbolic_var(const triton::ast::SharedAbstractNode &node)
 {
@@ -598,15 +88,44 @@ std::set<triton::ast::SharedAbstractNode> collect_symvars(const triton::ast::Sha
 	}
 	return result;
 }
-triton::ast::SharedAbstractNode b(triton::API& ctx, const triton::ast::SharedAbstractNode& node)
+bool is_unary_operation(const triton::arch::Instruction &triton_instruction)
 {
-	if (node->getType() == triton::ast::BVXOR_NODE)
+	switch (triton_instruction.getType())
 	{
-		if (node->getChildren()[0]->equalTo(node->getChildren()[1]))
-			return ctx.getAstContext()->bv(0, node->getBitvectorSize());
+		case triton::arch::x86::ID_INS_INC:
+		case triton::arch::x86::ID_INS_DEC:
+		case triton::arch::x86::ID_INS_NEG:
+		case triton::arch::x86::ID_INS_NOT:
+			return true;
+
+		default:
+			return false;
 	}
-	return node;
 }
+bool is_binary_operation(const triton::arch::Instruction &triton_instruction)
+{
+	switch (triton_instruction.getType())
+	{
+		case triton::arch::x86::ID_INS_ADD:
+		case triton::arch::x86::ID_INS_SUB:
+		case triton::arch::x86::ID_INS_SHL:
+		case triton::arch::x86::ID_INS_SHR:
+		case triton::arch::x86::ID_INS_RCR:
+		case triton::arch::x86::ID_INS_RCL:
+		case triton::arch::x86::ID_INS_ROL:
+		case triton::arch::x86::ID_INS_ROR:
+		case triton::arch::x86::ID_INS_AND:
+		case triton::arch::x86::ID_INS_OR:
+		case triton::arch::x86::ID_INS_XOR:
+		case triton::arch::x86::ID_INS_CMP:
+		case triton::arch::x86::ID_INS_TEST:
+			return true;
+
+		default:
+			return false;
+	}
+}
+
 
 // VMProtectAnalyzer
 VMProtectAnalyzer::VMProtectAnalyzer(triton::arch::architecture_e arch)
@@ -616,7 +135,6 @@ VMProtectAnalyzer::VMProtectAnalyzer(triton::arch::architecture_e arch)
 	triton_api->setMode(triton::modes::ALIGNED_MEMORY, true);
 	//triton_api->setAstRepresentationMode(triton::ast::representations::PYTHON_REPRESENTATION);
 	this->m_scratch_size = 0;
-	this->m_temp = 0;
 }
 VMProtectAnalyzer::~VMProtectAnalyzer()
 {
@@ -638,47 +156,38 @@ bool VMProtectAnalyzer::is_x64() const
 	}
 }
 
+triton::arch::Register VMProtectAnalyzer::get_bp_register() const
+{
+	return this->is_x64() ? triton_api->registers.x86_rbp : triton_api->registers.x86_ebp;
+}
+triton::arch::Register VMProtectAnalyzer::get_sp_register() const
+{
+	const triton::arch::CpuInterface *_cpu = triton_api->getCpuInstance();
+	if (!_cpu)
+		throw std::runtime_error("CpuInterface is nullptr");
+
+	return _cpu->getStackPointer();
+}
+triton::arch::Register VMProtectAnalyzer::get_ip_register() const
+{
+	const triton::arch::CpuInterface *_cpu = triton_api->getCpuInstance();
+	if (!_cpu)
+		throw std::runtime_error("CpuInterface is nullptr");
+
+	return _cpu->getProgramCounter();
+}
+
 triton::uint64 VMProtectAnalyzer::get_bp() const
 {
-	switch (triton_api->getArchitecture())
-	{
-		case triton::arch::ARCH_X86:
-			return triton_api->getConcreteRegisterValue(triton_api->registers.x86_ebp).convert_to<triton::uint64>();
-
-		case triton::arch::ARCH_X86_64:
-			return triton_api->getConcreteRegisterValue(triton_api->registers.x86_rbp).convert_to<triton::uint64>();
-
-		default:
-			throw std::runtime_error("invalid architecture");
-	}
+	return triton_api->getConcreteRegisterValue(this->get_bp_register()).convert_to<triton::uint64>();
 }
 triton::uint64 VMProtectAnalyzer::get_sp() const
 {
-	switch (triton_api->getArchitecture())
-	{
-		case triton::arch::ARCH_X86:
-			return triton_api->getConcreteRegisterValue(triton_api->registers.x86_esp).convert_to<triton::uint64>();
-
-		case triton::arch::ARCH_X86_64:
-			return triton_api->getConcreteRegisterValue(triton_api->registers.x86_rsp).convert_to<triton::uint64>();
-
-		default:
-			throw std::runtime_error("invalid architecture");
-	}
+	return triton_api->getConcreteRegisterValue(this->get_sp_register()).convert_to<triton::uint64>();
 }
 triton::uint64 VMProtectAnalyzer::get_ip() const
 {
-	switch (triton_api->getArchitecture())
-	{
-		case triton::arch::ARCH_X86:
-			return triton_api->getConcreteRegisterValue(triton_api->registers.x86_eip).convert_to<triton::uint64>();
-
-		case triton::arch::ARCH_X86_64:
-			return triton_api->getConcreteRegisterValue(triton_api->registers.x86_rip).convert_to<triton::uint64>();
-
-		default:
-			throw std::runtime_error("invalid architecture");
-	}
+	return triton_api->getConcreteRegisterValue(this->get_ip_register()).convert_to<triton::uint64>();
 }
 
 void VMProtectAnalyzer::symbolize_registers()
@@ -693,8 +202,7 @@ void VMProtectAnalyzer::symbolize_registers()
 		triton::engines::symbolic::SharedSymbolicVariable symvar_esi = triton_api->symbolizeRegister(triton_api->registers.x86_rsi);
 		triton::engines::symbolic::SharedSymbolicVariable symvar_edi = triton_api->symbolizeRegister(triton_api->registers.x86_rdi);
 		triton::engines::symbolic::SharedSymbolicVariable symvar_ebp = triton_api->symbolizeRegister(triton_api->registers.x86_rbp);
-		triton::engines::symbolic::SharedSymbolicVariable symvar_esp = triton_api->symbolizeRegister(triton_api->registers.x86_rsp);
-
+		//triton::engines::symbolic::SharedSymbolicVariable symvar_esp = triton_api->symbolizeRegister(triton_api->registers.x86_rsp);
 
 		triton::engines::symbolic::SharedSymbolicVariable symvar_r8 = triton_api->symbolizeRegister(triton_api->registers.x86_r8);
 		triton::engines::symbolic::SharedSymbolicVariable symvar_r9 = triton_api->symbolizeRegister(triton_api->registers.x86_r9);
@@ -712,7 +220,7 @@ void VMProtectAnalyzer::symbolize_registers()
 		symvar_esi->setAlias("rsi");
 		symvar_edi->setAlias("rdi");
 		symvar_ebp->setAlias("rbp");
-		symvar_esp->setAlias("rsp");
+		//symvar_esp->setAlias("rsp");
 		symvar_r8->setAlias("r8");
 		symvar_r9->setAlias("r9");
 		symvar_r10->setAlias("r10");
@@ -731,7 +239,7 @@ void VMProtectAnalyzer::symbolize_registers()
 		triton::engines::symbolic::SharedSymbolicVariable symvar_esi = triton_api->symbolizeRegister(triton_api->registers.x86_esi);
 		triton::engines::symbolic::SharedSymbolicVariable symvar_edi = triton_api->symbolizeRegister(triton_api->registers.x86_edi);
 		triton::engines::symbolic::SharedSymbolicVariable symvar_ebp = triton_api->symbolizeRegister(triton_api->registers.x86_ebp);
-		triton::engines::symbolic::SharedSymbolicVariable symvar_esp = triton_api->symbolizeRegister(triton_api->registers.x86_esp);
+		//triton::engines::symbolic::SharedSymbolicVariable symvar_esp = triton_api->symbolizeRegister(triton_api->registers.x86_esp);
 		symvar_eax->setAlias("eax");
 		symvar_ebx->setAlias("ebx");
 		symvar_ecx->setAlias("ecx");
@@ -739,7 +247,7 @@ void VMProtectAnalyzer::symbolize_registers()
 		symvar_esi->setAlias("esi");
 		symvar_edi->setAlias("edi");
 		symvar_ebp->setAlias("ebp");
-		symvar_esp->setAlias("esp");
+		//symvar_esp->setAlias("esp");
 	}
 }
 
@@ -850,144 +358,6 @@ bool VMProtectAnalyzer::is_fetch_arguments(const triton::ast::SharedAbstractNode
 	return context->arguments.find(symvar->getId()) != context->arguments.end();
 }
 
-bool VMProtectAnalyzer::is_push(VMPHandlerContext *context)
-{
-	// 1 destination (stack)
-	// stack_offset < 0
-	char buf[256];
-	if (context->destinations.size() != 1)
-		return false;
-
-	triton::sint64 stack_offset = this->get_bp() - context->stack;	// needs to be signed
-	if (stack_offset >= 0)
-		return false;
-
-	// <runtime_address, <dest, source>>
-	std::pair<triton::uint64,
-		std::pair<triton::ast::SharedAbstractNode, triton::ast::SharedAbstractNode>> _pair = *context->destinations.begin();
-	const triton::uint64 runtime_address = _pair.first;
-	const triton::ast::SharedAbstractNode& dest = _pair.second.first;
-	const triton::ast::SharedAbstractNode& source = _pair.second.second;
-	if (!this->is_stack_address(dest, context))
-		return false;
-
-	// [stack] = source
-	if (source->isSymbolized())
-	{
-		const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(source, true);
-		const triton::engines::symbolic::SharedSymbolicVariable symvar = get_symbolic_var(simplified);
-		if (symvar)
-		{
-			if (context->vmvars.find(symvar->getId()) != context->vmvars.end())
-			{
-				// push VM_VAR
-				std::cout << "push VM_VAR handler detected" << std::endl;
-
-				// disgusting impl
-				const std::size_t _pos = symvar->getAlias().find("VM_VAR_");
-				if (_pos != std::string::npos)
-				{
-					unsigned long long scratch_offset = std::stoi(symvar->getAlias().substr(_pos + strlen("VM_VAR_")));
-					if (stack_offset == (-8))
-						sprintf_s(buf, 256, "push qword ptr Scratch:[0x%llX]", scratch_offset);
-					else if (stack_offset == (-4))
-						sprintf_s(buf, 256, "push dword ptr Scratch:[0x%llX]", scratch_offset);
-					output_strings.push_back(buf);
-					return true;
-				}
-			}
-			else if (symvar->getId() == context->symvar_stack->getId())
-			{
-				// push stack(ebp)
-				std::cout << "push SP handler detected" << std::endl;
-				output_strings.push_back("push SP");
-				return true;
-			}
-		}
-	}
-	else
-	{
-		// push immediate
-		const triton::uint64 immediate = source->evaluate().convert_to<triton::uint64>();
-		if (stack_offset == (-8))
-		{
-			std::cout << "push Qword(" << immediate << ") handler detected" << std::endl;
-			sprintf_s(buf, 256, "push Qword(0x%llX)", immediate);
-			output_strings.push_back(buf);
-		}
-		else if (stack_offset == (-4))
-		{
-			std::cout << "push Dword(" << immediate << ") handler detected" << std::endl;
-			sprintf_s(buf, 256, "push Dword(0x%llX)", immediate);
-			output_strings.push_back(buf);
-		}
-		else if (stack_offset == (-2))
-		{
-			std::cout << "push Word(" << immediate << ") handler detected" << std::endl;
-			sprintf_s(buf, 256, "push Word(0x%llX)", immediate);
-			output_strings.push_back(buf);
-		}
-		else
-		{
-			throw std::runtime_error("invalid stack offset");
-		}
-		return true;
-	}
-	return false;
-}
-bool VMProtectAnalyzer::is_pop(VMPHandlerContext *context)
-{
-	char buf[256];
-	const triton::sint64 stack_offset = this->get_bp() - context->stack;	// needs to be signed
-	if (stack_offset != 2 && stack_offset != 4 && stack_offset != 8)
-		return false;
-
-	// 1 arg, 1 dest(stack), stack_offset>0
-	if (context->arguments.size() != 1 || context->destinations.size() != 1)
-		return false;
-
-	const auto _pair = *context->destinations.begin();
-	const triton::uint64 runtime_address = _pair.first;
-	const triton::ast::SharedAbstractNode& dest = _pair.second.first;
-	const triton::ast::SharedAbstractNode& source = _pair.second.second;
-	if (!this->is_scratch_area_address(dest, context))
-		return false;
-
-	const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(source, true);
-	if (simplified->getType() == triton::ast::VARIABLE_NODE)
-	{
-		const triton::engines::symbolic::SharedSymbolicVariable symvar =
-			std::dynamic_pointer_cast<triton::ast::VariableNode>(simplified)->getSymbolicVariable();
-		if (symvar->getAlias() == "arg0")
-		{
-			if (stack_offset == 8)
-			{
-				std::cout << "pop qword [VM_VAR] handler detected" << std::endl;
-				sprintf_s(buf, 256, "pop qword ptr Scratch:[0x%llX]", runtime_address - context->x86_sp);
-				output_strings.push_back(buf);
-			}
-			else if (stack_offset == 4)
-			{
-				std::cout << "pop dword ptr [VM_VAR] handler detected" << std::endl;
-				sprintf_s(buf, 256, "pop dword ptr Scratch:[0x%llX]", runtime_address - context->x86_sp);
-				output_strings.push_back(buf);
-			}
-			else if (stack_offset == 2)
-			{
-				std::cout << "pop word ptr [VM_VAR] handler detected" << std::endl;
-				sprintf_s(buf, 256, "pop word ptr Scratch:[0x%llX]", runtime_address - context->x86_sp);
-				output_strings.push_back(buf);
-			}
-			else
-			{
-				throw std::runtime_error("invalid stack offset");
-			}
-			return true;
-		}
-	}
-	return false;
-}
-
 void VMProtectAnalyzer::load(AbstractStream& stream,
 	unsigned long long module_base, unsigned long long vmp0_address, unsigned long long vmp0_size)
 {
@@ -1003,6 +373,8 @@ void VMProtectAnalyzer::load(AbstractStream& stream,
 	triton_api->setConcreteMemoryAreaValue(vmp_section_address, (const triton::uint8 *)vmp0, vmp_section_size);
 	free(vmp0);
 }
+
+// vm-enter
 void VMProtectAnalyzer::analyze_vm_enter(AbstractStream& stream, unsigned long long address)
 {
 	// reset symbolic
@@ -1024,10 +396,7 @@ void VMProtectAnalyzer::analyze_vm_enter(AbstractStream& stream, unsigned long l
 		const std::vector<xed_uint8_t> bytes = instruction->get_bytes();
 
 		// fix ip
-		if (this->is_x64())
-			triton_api->setConcreteRegisterValue(triton_api->registers.x86_rip, instruction->get_addr());
-		else
-			triton_api->setConcreteRegisterValue(triton_api->registers.x86_eip, instruction->get_addr());
+		triton_api->setConcreteRegisterValue(this->get_ip_register(), instruction->get_addr());
 
 		// do stuff with triton
 		triton::arch::Instruction triton_instruction;
@@ -1148,26 +517,539 @@ void VMProtectAnalyzer::analyze_vm_enter(AbstractStream& stream, unsigned long l
 	printf("scratch_size: 0x%016llX, scratch_length: %lld\n", scratch_size, scratch_length);
 	this->m_scratch_size = scratch_size;
 }
+
+
+// vm-handler
+void VMProtectAnalyzer::symbolize_memory(const triton::arch::MemoryAccess& mem, VMPHandlerContext *context)
+{
+	const triton::uint64 address = mem.getAddress();
+	triton::ast::SharedAbstractNode lea_ast = mem.getLeaAst();
+	if (!lea_ast)
+	{
+		// most likely can be ignored
+		return;
+	}
+
+	lea_ast = triton_api->processSimplification(lea_ast, true);
+	if (!lea_ast->isSymbolized())
+	{
+		// most likely can be ignored
+		return;
+	}
+
+	if (this->is_bytecode_address(lea_ast, context))
+	{
+		// bytecode can be considered const value
+		triton_api->taintMemory(mem);
+	}
+
+	// lea_ast = context + const
+	else if (this->is_scratch_area_address(lea_ast, context))
+	{
+		// [EBP+offset]
+		const triton::uint64 scratch_offset = lea_ast->evaluate().convert_to<triton::uint64>() - context->x86_sp;
+
+		triton::engines::symbolic::SharedSymbolicVariable symvar_vmreg = triton_api->symbolizeMemory(mem);
+		context->scratch_variables.insert(std::make_pair(symvar_vmreg->getId(), symvar_vmreg));
+		std::cout << "Load Scratch:[0x" << std::hex << scratch_offset << "]" << std::endl;
+
+		// TempVar = VM_REG
+		auto temp_variable = IR::Variable::create_variable(mem.getSize());
+
+		auto ir_imm = std::make_shared<IR::Immediate>(scratch_offset);
+		std::shared_ptr<IR::Expression> right_expression = std::make_shared<IR::Memory>(ir_imm, IR::ir_segment_scratch, (IR::ir_size)mem.getSize());
+
+		auto assign = std::make_shared<IR::Assign>(temp_variable, right_expression);
+		context->m_statements.push_back(assign);
+		context->m_expression_map[symvar_vmreg->getId()] = temp_variable;
+		symvar_vmreg->setAlias(temp_variable->get_name());
+	}
+	else if (this->is_stack_address(lea_ast, context))
+	{
+		const triton::uint64 offset = address - context->stack;
+
+		triton::engines::symbolic::SharedSymbolicVariable symvar_arg = triton_api->symbolizeMemory(mem);
+		context->arguments.insert(std::make_pair(symvar_arg->getId(), symvar_arg));
+		std::cout << "Load [EBP+0x" << std::hex << offset << "]" << std::endl;
+
+		// test i guess
+		char v[1024];
+		sprintf_s(v, 1024, "[SP+0x%llX]", offset);
+
+		// TempVar = ARG (possibly pop)
+		auto temp_variable = IR::Variable::create_variable(mem.getSize());
+		auto assign = std::make_shared<IR::Assign>(temp_variable, std::make_shared<IR::Variable>(v, (IR::ir_size)mem.getSize()));
+		context->m_statements.push_back(assign);
+		context->m_expression_map[symvar_arg->getId()] = temp_variable;
+		symvar_arg->setAlias(temp_variable->get_name());
+	}
+	else if (this->is_fetch_arguments(lea_ast, context))
+	{
+		// lea_ast == VM_REG_X
+		triton::arch::Register segment_register = mem.getConstSegmentRegister();
+		if (segment_register.getId() == triton::arch::ID_REG_INVALID)
+		{
+			// DS?
+			//segment_register = triton_api->registers.x86_ds;
+		}
+		triton::engines::symbolic::SharedSymbolicVariable symvar_source = get_symbolic_var(lea_ast);
+
+		const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeMemory(mem);
+		std::cout << "Deref(" << lea_ast << "," << segment_register.getName() << ")" << std::endl;
+
+		// IR
+		auto it = context->m_expression_map.find(symvar_source->getId());
+		if (it == context->m_expression_map.end())
+			throw std::runtime_error("what do you mean");
+
+		// declare Temp
+		auto temp_variable = IR::Variable::create_variable(mem.getSize());
+
+		// Temp = deref(expr)
+		std::shared_ptr<IR::Expression> expr = it->second;
+		std::shared_ptr<IR::Expression> deref = std::make_shared<IR::Dereference>(expr, (IR::ir_segment)segment_register.getId(), (IR::ir_size)mem.getSize());
+		context->m_statements.push_back(std::make_shared<IR::Assign>(temp_variable, deref));
+		context->m_expression_map[symvar->getId()] = temp_variable;
+		symvar->setAlias(temp_variable->get_name());
+	}
+	else
+	{
+		std::cout << "unknown read addr: " << std::hex << address << " " << lea_ast << std::endl;
+	}
+}
+std::vector<std::shared_ptr<IR::Expression>> VMProtectAnalyzer::save_expressions(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context)
+{
+	std::vector<std::shared_ptr<IR::Expression>> expressions;
+	if (!is_unary_operation(triton_instruction) && !is_binary_operation(triton_instruction))
+	{
+		return expressions;
+	}
+
+	bool do_it = false;
+	for (const auto& operand : triton_instruction.operands)
+	{
+		if (operand.getType() == triton::arch::operand_e::OP_IMM)
+		{
+			expressions.push_back(std::make_shared<IR::Immediate>(
+				operand.getConstImmediate().getValue()));
+		}
+		else if (operand.getType() == triton::arch::operand_e::OP_MEM)
+		{
+			const triton::arch::MemoryAccess& _mem = operand.getConstMemory();
+			triton::engines::symbolic::SharedSymbolicVariable _symvar = get_symbolic_var(triton_api->processSimplification(triton_api->getMemoryAst(_mem), true));
+			if (_symvar)
+			{
+				// load symbolic
+				auto _it = context->m_expression_map.find(_symvar->getId());
+				if (_it != context->m_expression_map.end())
+				{
+					expressions.push_back(_it->second);
+					do_it = true;
+					continue;
+				}
+			}
+
+			// otherwise immediate
+			expressions.push_back(std::make_shared<IR::Immediate>(
+				triton_api->getConcreteMemoryValue(_mem).convert_to<triton::uint64>()));
+		}
+		else if (operand.getType() == triton::arch::operand_e::OP_REG)
+		{
+			const triton::arch::Register& _reg = operand.getConstRegister();
+			triton::engines::symbolic::SharedSymbolicVariable _symvar = get_symbolic_var(triton_api->processSimplification(triton_api->getRegisterAst(_reg), true));
+			if (_symvar)
+			{
+				if (_symvar->getId() == context->symvar_stack->getId())
+				{
+					// nope...
+					do_it = false;
+					break;
+				}
+
+				// load symbolic
+				auto _it = context->m_expression_map.find(_symvar->getId());
+				if (_it != context->m_expression_map.end())
+				{
+					expressions.push_back(_it->second);
+					do_it = true;
+					continue;
+				}
+			}
+
+			// otherwise immediate
+			expressions.push_back(std::make_shared<IR::Immediate>(
+				triton_api->getConcreteRegisterValue(_reg).convert_to<triton::uint64>()));
+		}
+		else
+			throw std::runtime_error("invalid operand type");
+	}
+	if (!do_it)
+		expressions.clear();
+	return expressions;
+}
+void VMProtectAnalyzer::check_arity_operation(triton::arch::Instruction &triton_instruction, const std::vector<std::shared_ptr<IR::Expression>> &operands_expressions, VMPHandlerContext *context)
+{
+	if (triton_instruction.getType() == triton::arch::x86::ID_INS_CPUID)
+	{
+		std::shared_ptr<IR::Cpuid> statement = std::make_shared<IR::Cpuid>();
+		context->m_statements.push_back(statement);
+
+		auto symvar_eax = this->triton_api->symbolizeRegister(triton_api->registers.x86_eax);
+		auto symvar_ebx = this->triton_api->symbolizeRegister(triton_api->registers.x86_ebx);
+		auto symvar_ecx = this->triton_api->symbolizeRegister(triton_api->registers.x86_ecx);
+		auto symvar_edx = this->triton_api->symbolizeRegister(triton_api->registers.x86_edx);
+		context->m_expression_map[symvar_eax->getId()] = std::make_shared<IR::Register>(triton_api->registers.x86_eax);
+		context->m_expression_map[symvar_ebx->getId()] = std::make_shared<IR::Register>(triton_api->registers.x86_ebx);
+		context->m_expression_map[symvar_ecx->getId()] = std::make_shared<IR::Register>(triton_api->registers.x86_ecx);
+		context->m_expression_map[symvar_edx->getId()] = std::make_shared<IR::Register>(triton_api->registers.x86_edx);
+		symvar_eax->setAlias("cpuid_eax");
+		symvar_ebx->setAlias("cpuid_ebx");
+		symvar_ecx->setAlias("cpuid_ecx");
+		symvar_edx->setAlias("cpuid_edx");
+		return;
+	}
+	else if (triton_instruction.getType() == triton::arch::x86::ID_INS_RDTSC)
+	{
+		std::shared_ptr<IR::Statement> statement = std::make_shared<IR::Rdtsc>();
+		context->m_statements.push_back(statement);
+
+		auto symvar_eax = this->triton_api->symbolizeRegister(triton_api->registers.x86_eax);
+		auto symvar_edx = this->triton_api->symbolizeRegister(triton_api->registers.x86_edx);
+		context->m_expression_map[symvar_eax->getId()] = std::make_shared<IR::Register>(triton_api->registers.x86_eax);
+		context->m_expression_map[symvar_edx->getId()] = std::make_shared<IR::Register>(triton_api->registers.x86_edx);
+		symvar_eax->setAlias("rdtsc_eax");
+		symvar_edx->setAlias("rdtsc_edx");
+		return;
+	}
+
+	bool unary = is_unary_operation(triton_instruction) && operands_expressions.size() == 1;
+	bool binary = is_binary_operation(triton_instruction) && operands_expressions.size() == 2;
+	if (!unary && !binary)
+		return;
+
+	// symbolize left operand
+	triton::engines::symbolic::SharedSymbolicVariable symvar;
+	const auto &operand0 = triton_instruction.operands[0];
+	if (operand0.getType() == triton::arch::operand_e::OP_REG)
+	{
+		const triton::arch::Register& _reg = operand0.getConstRegister();
+		triton_api->concretizeRegister(_reg);
+		symvar = triton_api->symbolizeRegister(_reg);
+	}
+	else if (operand0.getType() == triton::arch::operand_e::OP_MEM)
+	{
+		const triton::arch::MemoryAccess& _mem = operand0.getConstMemory();
+		triton_api->concretizeMemory(_mem);
+		symvar = triton_api->symbolizeMemory(_mem);
+	}
+	else
+	{
+		throw std::runtime_error("invalid operand type");
+	}
+
+
+	std::shared_ptr<IR::Variable> temp_variable = IR::Variable::create_variable(operand0.getSize());
+	std::shared_ptr<IR::Expression> expr;
+	if (unary)
+	{
+		// unary
+		auto op0_expression = operands_expressions[0];
+		switch (triton_instruction.getType())
+		{
+			case triton::arch::x86::ID_INS_INC:
+			{
+				expr = std::make_shared<IR::Inc>(op0_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_DEC:
+			{
+				expr = std::make_shared<IR::Dec>(op0_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_NEG:
+			{
+				expr = std::make_shared<IR::Neg>(op0_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_NOT:
+			{
+				expr = std::make_shared<IR::Not>(op0_expression);
+				break;
+			}
+			default:
+			{
+				throw std::runtime_error("unknown unary operation");
+			}
+		}
+	}
+	else
+	{
+		// binary
+		auto op0_expression = operands_expressions[0];
+		auto op1_expression = operands_expressions[1];
+		switch (triton_instruction.getType())
+		{
+			case triton::arch::x86::ID_INS_ADD:
+			{
+				expr = std::make_shared<IR::Add>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_SUB:
+			{
+				expr = std::make_shared<IR::Sub>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_SHL:
+			{
+				expr = std::make_shared<IR::Shl>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_SHR:
+			{
+				expr = std::make_shared<IR::Shr>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_RCR:
+			{
+				expr = std::make_shared<IR::Rcr>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_RCL:
+			{
+				expr = std::make_shared<IR::Rcl>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_ROL:
+			{
+				expr = std::make_shared<IR::Rol>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_ROR:
+			{
+				expr = std::make_shared<IR::Ror>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_AND:
+			{
+				expr = std::make_shared<IR::And>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_OR:
+			{
+				expr = std::make_shared<IR::Or>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_XOR:
+			{
+				expr = std::make_shared<IR::Xor>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_CMP:
+			{
+				expr = std::make_shared<IR::Cmp>(op0_expression, op1_expression);
+				break;
+			}
+			case triton::arch::x86::ID_INS_TEST:
+			{
+				expr = std::make_shared<IR::Test>(op0_expression, op1_expression);
+				break;
+			}
+			default:
+			{
+				throw std::runtime_error("unknown binary operation");
+			}
+		}
+	}
+	context->m_statements.push_back(std::make_shared<IR::Assign>(temp_variable, expr));
+	context->m_expression_map[symvar->getId()] = temp_variable;
+	symvar->setAlias(temp_variable->get_name());
+}
+void VMProtectAnalyzer::check_store_access(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context)
+{
+	const auto& storeAccess = triton_instruction.getStoreAccess();
+	for (const std::pair<triton::arch::MemoryAccess, triton::ast::SharedAbstractNode>& pair : storeAccess)
+	{
+		const triton::arch::MemoryAccess &mem = pair.first;
+		//const triton::ast::SharedAbstractNode &mem_ast = pair.second;
+		const triton::ast::SharedAbstractNode &mem_ast = triton_api->getMemoryAst(mem);
+		const triton::uint64 address = mem.getAddress();
+		triton::ast::SharedAbstractNode lea_ast = mem.getLeaAst();
+		if (!lea_ast)
+		{
+			// most likely can be ignored
+			continue;
+		}
+
+		lea_ast = triton_api->processSimplification(lea_ast, true);
+		if (!lea_ast->isSymbolized())
+		{
+			// most likely can be ignored
+			continue;
+		}
+
+		if (this->is_scratch_area_address(lea_ast, context))
+		{
+			const triton::uint64 scratch_offset = lea_ast->evaluate().convert_to<triton::uint64>() - context->x86_sp;
+			std::cout << "modifies [x86_sp + 0x" << std::hex << scratch_offset << "]" << std::endl;
+
+			// create IR (VM_REG = mem_ast)
+			auto source_node = triton_api->processSimplification(mem_ast, true);
+			triton::engines::symbolic::SharedSymbolicVariable symvar = get_symbolic_var(source_node);
+			if (symvar)
+			{
+				auto ir_imm = std::make_shared<IR::Immediate>(scratch_offset);
+				std::shared_ptr<IR::Expression> v1 = std::make_shared<IR::Memory>(ir_imm, IR::ir_segment_scratch, (IR::ir_size)mem.getSize());
+				auto it = context->m_expression_map.find(symvar->getId());
+				if (it != context->m_expression_map.end())
+				{
+					std::shared_ptr<IR::Expression> expr = it->second;
+					context->m_statements.push_back(std::make_shared<IR::Assign>(v1, expr));
+				}
+				else if (symvar->getId() == context->symvar_stack->getId())
+				{
+					std::shared_ptr<IR::Expression> expr = std::make_shared<IR::Register>(this->get_sp_register());
+					context->m_statements.push_back(std::make_shared<IR::Assign>(v1, expr));
+				}
+				else if (symvar->getAlias().find("eflags") != std::string::npos)
+				{
+					std::shared_ptr<IR::Expression> expr = std::make_shared<IR::Register>(triton_api->registers.x86_eflags);
+					context->m_statements.push_back(std::make_shared<IR::Assign>(v1, expr));
+				}
+				else
+				{
+					printf("%s\n", symvar->getAlias().c_str());
+					throw std::runtime_error("what do you mean 2");
+				}
+			}
+			else
+			{
+				std::cout << "source_node: " << source_node << std::endl;
+			}
+		}
+		else if (this->is_stack_address(lea_ast, context))
+		{
+			// stores to stack
+			const triton::uint64 stack_offset = address - context->stack;
+
+			std::shared_ptr<IR::Expression> expr;
+			auto get_expr = [this, context](std::shared_ptr<triton::API> ctx, triton::ast::SharedAbstractNode mem_ast)
+			{
+				std::shared_ptr<IR::Expression> expr;
+				auto simplified_source_node = ctx->processSimplification(mem_ast, true);
+				if (!simplified_source_node->isSymbolized())
+				{
+					// expression is immediate
+					expr = std::make_shared<IR::Immediate>(simplified_source_node->evaluate().convert_to<triton::uint64>());
+				}
+				else
+				{
+					triton::engines::symbolic::SharedSymbolicVariable _symvar = get_symbolic_var(simplified_source_node);
+					if (_symvar)
+					{
+						auto _it = context->m_expression_map.find(_symvar->getId());
+						if (_it == context->m_expression_map.end())
+						{
+							throw std::runtime_error("what do you mean...");
+						}
+						expr = _it->second;
+					}
+				}
+				return expr;
+			};
+			expr = get_expr(this->triton_api, mem_ast);
+			if (!expr && mem.getSize() == 2)
+			{
+				const triton::arch::MemoryAccess _mem(mem.getAddress(), 1);
+				expr = get_expr(this->triton_api, triton_api->getMemoryAst(_mem));
+			}
+
+			// should be push
+			if (expr)
+			{
+				auto ir_stack = context->m_expression_map[context->symvar_stack->getId()];
+				auto ir_stack_address = std::make_shared<IR::Add>(ir_stack, std::make_shared<IR::Immediate>(stack_offset));
+
+				std::shared_ptr<IR::Expression> v1 = std::make_shared<IR::Memory>(
+					ir_stack_address, (IR::ir_segment)mem.getConstSegmentRegister().getId(), (IR::ir_size)mem.getSize());
+				context->m_statements.push_back(std::make_shared<IR::Assign>(v1, expr));
+			}
+			else
+			{
+				std::cout << "unknown store addr: " << std::hex << address << ", lea_ast: " << lea_ast 
+					<< ", simplified_source_node: " << triton_api->processSimplification(mem_ast, true) << std::endl;
+			}
+		}
+		else
+		{
+			// create IR (VM_REG = mem_ast)
+			// get right expression
+			std::shared_ptr<IR::Expression> expr;
+			auto simplified_source_node = triton_api->processSimplification(mem_ast, true);
+			if (!simplified_source_node->isSymbolized())
+			{
+				// expression is immediate
+				expr = std::make_shared<IR::Immediate>(simplified_source_node->evaluate().convert_to<triton::uint64>());
+			}
+			else
+			{
+				triton::engines::symbolic::SharedSymbolicVariable symvar1 = get_symbolic_var(simplified_source_node);
+				if (symvar1)
+				{
+					auto _it = context->m_expression_map.find(symvar1->getId());
+					if (_it == context->m_expression_map.end())
+					{
+						throw std::runtime_error("what do you mean...");
+					}
+					expr = _it->second;
+				}
+			}
+
+			triton::engines::symbolic::SharedSymbolicVariable symvar0 = get_symbolic_var(lea_ast);
+			if (symvar0 && expr)
+			{
+				auto it0 = context->m_expression_map.find(symvar0->getId());
+				if (it0 != context->m_expression_map.end())
+				{
+					std::shared_ptr<IR::Expression> v1 = std::make_shared<IR::Memory>(it0->second, 
+						(IR::ir_segment)mem.getConstSegmentRegister().getId(), (IR::ir_size)mem.getSize());
+					context->m_statements.push_back(std::make_shared<IR::Assign>(v1, expr));
+				}
+				else
+				{
+					throw std::runtime_error("what do you mean 2");
+				}
+			}
+			else
+			{
+				std::cout << "unknown store addr: " << std::hex << address << ", lea_ast: " << lea_ast << ", simplified_source_node: " << simplified_source_node << std::endl;
+			}
+		}
+	}
+}
+
 void VMProtectAnalyzer::analyze_vm_handler(AbstractStream& stream, unsigned long long handler_address)
 {
+	this->m_scratch_size = 0xC0; // test
+
 	// reset
 	triton_api->concretizeAllMemory();
 	triton_api->concretizeAllRegister();
 
 	// allocate scratch area
-	const triton::arch::Register rb_register = this->is_x64() ? triton_api->registers.x86_rbp : triton_api->registers.x86_ebp;
-	const triton::arch::Register sp_register = this->is_x64() ? triton_api->registers.x86_rsp : triton_api->registers.x86_esp;
+	const triton::arch::Register bp_register = this->get_bp_register();
+	const triton::arch::Register sp_register = this->get_sp_register();
 	const triton::arch::Register si_register = this->is_x64() ? triton_api->registers.x86_rsi : triton_api->registers.x86_esi;
+	const triton::arch::Register ip_register = this->get_ip_register();
 
 	constexpr unsigned long c_stack_base = 0x1000;
-	triton_api->setConcreteRegisterValue(rb_register, c_stack_base);
+	triton_api->setConcreteRegisterValue(bp_register, c_stack_base);
 	triton_api->setConcreteRegisterValue(sp_register, c_stack_base - this->m_scratch_size);
 
 	unsigned int arg0 = c_stack_base;
 	triton_api->setConcreteMemoryAreaValue(c_stack_base, (const triton::uint8*)&arg0, 4);
 
 	// ebp = VM's "stack" pointer
-	triton::engines::symbolic::SharedSymbolicVariable symvar_stack = triton_api->symbolizeRegister(rb_register);
+	triton::engines::symbolic::SharedSymbolicVariable symvar_stack = triton_api->symbolizeRegister(bp_register);
 
 	// esi = pointer to VM bytecode
 	triton::engines::symbolic::SharedSymbolicVariable symvar_bytecode = triton_api->symbolizeRegister(si_register);
@@ -1183,12 +1065,17 @@ void VMProtectAnalyzer::analyze_vm_handler(AbstractStream& stream, unsigned long
 	VMPHandlerContext context;
 	context.scratch_area_size = this->is_x64() ? 0x140 : 0x60;
 	context.address = handler_address;
-	context.stack = triton_api->getConcreteRegisterValue(rb_register).convert_to<triton::uint64>();
+	context.stack = triton_api->getConcreteRegisterValue(bp_register).convert_to<triton::uint64>();
 	context.bytecode = triton_api->getConcreteRegisterValue(si_register).convert_to<triton::uint64>();
 	context.x86_sp = triton_api->getConcreteRegisterValue(sp_register).convert_to<triton::uint64>();
 	context.symvar_stack = symvar_stack;
 	context.symvar_bytecode = symvar_bytecode;
 	context.symvar_x86_sp = symvar_x86_sp;
+
+	// expr
+	std::shared_ptr<IR::Expression> ir_stack = std::make_shared<IR::Variable>("STACK", (IR::ir_size)sp_register.getSize());
+	context.m_expression_map.insert(std::make_pair(symvar_stack->getId(), ir_stack));
+	//
 
 	std::shared_ptr<BasicBlock> basic_block;
 	auto handler_it = this->m_handlers.find(handler_address);
@@ -1202,65 +1089,142 @@ void VMProtectAnalyzer::analyze_vm_handler(AbstractStream& stream, unsigned long
 		basic_block = handler_it->second;
 	}
 
+	triton::uint64 expected_return_address = 0;
 	for (auto it = basic_block->instructions.begin(); it != basic_block->instructions.end();)
 	{
 		const std::shared_ptr<x86_instruction> xed_instruction = *it;
 		const std::vector<xed_uint8_t> bytes = xed_instruction->get_bytes();
+		bool mem_read = false;
+		for (xed_uint_t j = 0, memops = xed_instruction->get_number_of_memory_operands(); j < memops; j++)
+		{
+			if (xed_instruction->is_mem_read(j))
+			{
+				mem_read = true;
+				break;
+			}
+		}
 
 		// do stuff with triton
 		triton::arch::Instruction triton_instruction;
 		triton_instruction.setOpcode(&bytes[0], (triton::uint32)bytes.size());
 		triton_instruction.setAddress(xed_instruction->get_addr());
-		triton_api->processing(triton_instruction);
-		if (++it != basic_block->instructions.end())
+
+		// fix ip
+		triton_api->setConcreteRegisterValue(ip_register, xed_instruction->get_addr());
+
+		// DIS
+		triton_api->disassembly(triton_instruction);
+		if (mem_read 
+			&& (triton_instruction.getType() != triton::arch::x86::ID_INS_POP
+				&& triton_instruction.getType() != triton::arch::x86::ID_INS_POPFD)) // no need but makes life easier
 		{
-			// check store
-			this->storeAccess(triton_instruction, &context);
-
-			// check load
-			this->loadAccess(triton_instruction, &context);
-
-			// loop until it reaches end
-			std::cout << "\t" << triton_instruction << std::endl;
-			continue;
+			for (auto& operand : triton_instruction.operands)
+			{
+				if (operand.getType() == triton::arch::OP_MEM)
+				{
+					triton_api->getSymbolicEngine()->initLeaAst(operand.getMemory());
+					this->symbolize_memory(operand.getConstMemory(), &context);
+				}
+			}
 		}
+		std::vector<std::shared_ptr<IR::Expression>> operands_expressions = this->save_expressions(triton_instruction, &context);
 
-		if (xed_instruction->get_category() != XED_CATEGORY_UNCOND_BR 
+		triton_api->processing(triton_instruction);
+
+		// lol
+		this->check_arity_operation(triton_instruction, operands_expressions, &context);
+
+		// check store
+		this->check_store_access(triton_instruction, &context);
+
+		if (xed_instruction->get_category() != XED_CATEGORY_UNCOND_BR
 			|| xed_instruction->get_branch_displacement_width() == 0)
 		{
 			std::cout << "\t" << triton_instruction << std::endl;
 		}
-		if (basic_block->next_basic_block && basic_block->target_basic_block)
+
+		// symbolize eflags
+		static std::string ins_name;
+		for (const auto& pair : xed_instruction->get_written_registers())
 		{
-			// it ends with conditional branch
-			if (triton_instruction.isConditionTaken())
+			if (pair.is_flag())
 			{
+				ins_name = xed_instruction->get_name();
+				break;
+			}
+		}
+		if (triton_instruction.getType() == triton::arch::x86::ID_INS_PUSHFD)
+		{
+			triton::arch::MemoryAccess _mem(this->get_sp(), 4);
+			triton::engines::symbolic::SharedSymbolicVariable _symvar = triton_api->symbolizeMemory(_mem);
+			_symvar->setAlias(ins_name + "_eflags");
+
+			auto ir_eflags = std::make_shared<IR::Register>(triton_api->registers.x86_eflags);
+			context.m_expression_map.insert(std::make_pair(_symvar->getId(), ir_eflags));
+		}
+		else if (triton_instruction.getType() == triton::arch::x86::ID_INS_PUSHFQ)
+		{
+			triton::arch::MemoryAccess _mem(this->get_sp(), 8);
+			triton::engines::symbolic::SharedSymbolicVariable _symvar = triton_api->symbolizeMemory(_mem);
+			_symvar->setAlias(ins_name + "_eflags");
+
+			auto ir_eflags = std::make_shared<IR::Register>(triton_api->registers.x86_eflags);
+			context.m_expression_map.insert(std::make_pair(_symvar->getId(), ir_eflags));
+		}
+
+		if (++it != basic_block->instructions.end())
+		{
+			// loop until it reaches end
+			continue;
+		}
+
+		if (triton_instruction.getType() == triton::arch::x86::ID_INS_CALL)
+		{
+			expected_return_address = xed_instruction->get_addr() + 5;
+		}
+		else if (triton_instruction.getType() == triton::arch::x86::ID_INS_RET)
+		{
+			if (expected_return_address != 0 && this->get_ip() == expected_return_address)
+			{
+				basic_block = make_cfg(stream, expected_return_address);
+				it = basic_block->instructions.begin();
+			}
+		}
+
+		while (it == basic_block->instructions.end())
+		{
+			if (basic_block->next_basic_block && basic_block->target_basic_block)
+			{
+				// it ends with conditional branch
+				if (triton_instruction.isConditionTaken())
+				{
+					basic_block = basic_block->target_basic_block;
+				}
+				else
+				{
+					basic_block = basic_block->next_basic_block;
+				}
+			}
+			else if (basic_block->target_basic_block)
+			{
+				// it ends with jmp?
 				basic_block = basic_block->target_basic_block;
+			}
+			else if (basic_block->next_basic_block)
+			{
+				// just follow :)
+				basic_block = basic_block->next_basic_block;
 			}
 			else
 			{
-				basic_block = basic_block->next_basic_block;
+				// perhaps finishes?
+				goto l_categorize_handler;
 			}
+			it = basic_block->instructions.begin();
 		}
-		else if (basic_block->target_basic_block)
-		{
-			// it ends with jmp?
-			basic_block = basic_block->target_basic_block;
-		}
-		else if (basic_block->next_basic_block)
-		{
-			// just follow :)
-			basic_block = basic_block->next_basic_block;
-		}
-		else
-		{
-			// perhaps finishes?
-			break;
-		}
-
-		it = basic_block->instructions.begin();
 	}
 
+l_categorize_handler:
 	this->categorize_handler(&context);
 }
 void VMProtectAnalyzer::analyze_vm_exit(unsigned long long handler_address)
@@ -1368,188 +1332,6 @@ void VMProtectAnalyzer::analyze_vm_exit(unsigned long long handler_address)
 	}
 	this->output_strings.push_back("ret");
 }
-
-void VMProtectAnalyzer::loadAccess(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context)
-{
-	const auto& loadAccess = triton_instruction.getLoadAccess();
-	for (const std::pair<triton::arch::MemoryAccess, triton::ast::SharedAbstractNode>& pair : loadAccess)
-	{
-		const triton::arch::MemoryAccess &mem = pair.first;
-		const triton::ast::SharedAbstractNode &mem_ast = pair.second;
-		const triton::uint64 address = mem.getAddress();
-		triton::ast::SharedAbstractNode lea_ast = mem.getLeaAst();
-		if (!lea_ast)
-		{
-			// most likely can be ignored
-			continue;
-		}
-
-		lea_ast = triton_api->processSimplification(lea_ast, true);
-		if (!lea_ast->isSymbolized())
-		{
-			// most likely can be ignored
-			continue;
-		}
-
-		const triton::arch::Register& dest_register = this->get_dest_register(triton_instruction);
-		if (this->is_bytecode_address(lea_ast, context))
-		{
-			switch (mem.getSize())
-			{
-				case 1:
-				case 2:
-				case 4:
-				case 8:
-				{
-					// valid mem size
-					break;
-				}
-				default:
-				{
-					std::stringstream ss;
-					ss << "invalid mem size";
-					throw std::runtime_error(ss.str());
-				}
-			}
-
-			// bytecode can be considered const value
-			if (0)
-			{
-				std::string alias = "bytecode-" + std::to_string(mem.getSize());
-				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-				symvar->setAlias(alias);
-				context->bytecodes.insert(std::make_pair(symvar->getId(), symvar));
-			}
-			printf("%s=bytecode(%d)\n", dest_register.getName().c_str(), mem.getSize());
-		}
-		else if (this->is_scratch_area_address(lea_ast, context))
-		{
-			unsigned long long offset = lea_ast->evaluate().convert_to<unsigned long long>() - context->x86_sp;
-
-			char var_name[64];
-			sprintf_s(var_name, 64, "VM_VAR_%lld", offset);
-
-			const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-			symvar->setAlias(var_name);
-			context->vmvars.insert(std::make_pair(symvar->getId(), symvar));
-
-			std::cout << dest_register.getName() << "= [x86_sp + 0x" << std::hex << offset << "]" << std::endl;
-		}
-		else if (this->is_stack_address(lea_ast, context))
-		{
-			const triton::uint64 arg_offset = address - context->stack;
-			if (arg_offset == 0)
-			{
-				printf("%s=arg0(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
-				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-				symvar->setAlias("arg0");
-				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
-			}
-			else if (arg_offset == 2)
-			{
-				printf("%s=arg1(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
-				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-				symvar->setAlias("arg1");
-				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
-			}
-			else if (arg_offset == 4)
-			{
-				printf("%s=arg1(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
-				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-				symvar->setAlias("arg1");
-				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
-			}
-			else if (arg_offset == 8)
-			{
-				printf("%s=arg2(%dbytes)\n", dest_register.getName().c_str(), mem.getSize());
-				const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-				symvar->setAlias("arg2");
-				context->arguments.insert(std::make_pair(symvar->getId(), symvar));
-			}
-			else
-			{
-				throw std::runtime_error("invalid arg offset");
-			}
-		}
-		else if (this->is_fetch_arguments(lea_ast, context))
-		{
-			const triton::arch::Register &segment_register = mem.getConstSegmentRegister();
-			if (segment_register.getId() == triton::arch::ID_REG_INVALID)
-			{
-				// DS?
-			}
-
-			std::string alias = "fetch_" + segment_register.getName() + ":"
-				+ std::dynamic_pointer_cast<triton::ast::VariableNode>(lea_ast)->getSymbolicVariable()->getAlias();
-			const triton::arch::Register& dest_register = this->get_dest_register(triton_instruction);
-			const triton::engines::symbolic::SharedSymbolicVariable symvar = triton_api->symbolizeRegister(dest_register);
-			symvar->setAlias(alias);
-			context->fetched.insert(std::make_pair(symvar->getId(), symvar));
-
-			printf("fetched to %s\n", dest_register.getName().c_str());
-		}
-		else
-		{
-			std::cout << triton_instruction << std::endl;
-			std::cout << lea_ast << std::endl;
-			//throw std::runtime_error("unknown memory read has found.");
-		}
-	}
-}
-void VMProtectAnalyzer::storeAccess(triton::arch::Instruction &triton_instruction, VMPHandlerContext *context)
-{
-	const auto& storeAccess = triton_instruction.getStoreAccess();
-	for (const std::pair<triton::arch::MemoryAccess, triton::ast::SharedAbstractNode>& pair : storeAccess)
-	{
-		const triton::arch::MemoryAccess &mem = pair.first;
-		const triton::ast::SharedAbstractNode &mem_ast = pair.second;
-		const triton::uint64 address = mem.getAddress();
-		triton::ast::SharedAbstractNode lea_ast = mem.getLeaAst();
-		if (!lea_ast)
-		{
-			// most likely can be ignored
-			continue;
-		}
-
-		lea_ast = triton_api->processSimplification(lea_ast, true);
-		if (!lea_ast->isSymbolized())
-		{
-			// most likely can be ignored
-			continue;
-		}
-
-		if (this->is_scratch_area_address(lea_ast, context))
-		{
-			// mov MEM, REG
-			const triton::arch::Register& source_register = this->get_source_register(triton_instruction);
-			const triton::ast::SharedAbstractNode register_ast = triton_api->processSimplification(triton_api->getRegisterAst(source_register), true);
-			context->insert_scratch(lea_ast, register_ast);
-
-			const triton::uint64 scratch_offset = lea_ast->evaluate().convert_to<triton::uint64>() - context->x86_sp;
-			std::cout << "[x86_sp + 0x" << std::hex << scratch_offset << "] = " << register_ast << std::endl;
-		}
-		else if (this->is_stack_address(lea_ast, context))
-		{
-			// stores to stack
-			const triton::arch::Register& source_register = this->get_source_register(triton_instruction);
-			const triton::ast::SharedAbstractNode register_ast = triton_api->processSimplification(triton_api->getRegisterAst(source_register), true);
-			context->insert_scratch(lea_ast, register_ast);
-			std::cout << "[" << lea_ast << "]=" << register_ast << std::endl;
-		}
-		else if (this->is_fetch_arguments(lea_ast, context))
-		{
-			// mov MEM, REG
-			const triton::arch::Register& source_register = this->get_source_register(triton_instruction);
-			const triton::ast::SharedAbstractNode register_ast = triton_api->processSimplification(triton_api->getRegisterAst(source_register), true);
-			context->insert_scratch(lea_ast, register_ast);
-			std::cout << "[" << lea_ast << "]=" << register_ast << std::endl;
-		}
-		else
-		{
-			std::cout << lea_ast << std::endl;
-		}
-	}
-}
 void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 {
 	const triton::arch::Register rb_register = this->is_x64() ? triton_api->registers.x86_rbp : triton_api->registers.x86_ebp;
@@ -1563,354 +1345,129 @@ void VMProtectAnalyzer::categorize_handler(VMPHandlerContext *context)
 	printf("\tbytecode: 0x%016llX -> 0x%016llX\n", context->bytecode, bytecode);
 	printf("\tsp: 0x%016llX -> 0x%016llX\n", context->x86_sp, sp);
 	printf("\tstack: 0x%016llX -> 0x%016llX\n", context->stack, stack);
-	for (const auto &pair : context->destinations)
-	{
-		std::cout << "\t" << pair.second.first << "(0x" << std::hex << pair.first << ")="
-			<< triton_api->processSimplification(pair.second.second, true) << std::endl;
-	}
 
 	bool handler_detected = false;
-	auto it = context->destinations.begin();
 
 	// check if push
 	triton::sint64 stack_offset = stack - context->stack;	// needs to be signed
-	if (this->is_push(context))
+	if (stack_offset)
 	{
-		handler_detected = true;
+		// just for testing purpose
+		std::shared_ptr<IR::Expression> ir_stack = context->m_expression_map[context->symvar_stack->getId()];
+		std::shared_ptr<IR::Expression> _add = std::make_shared<IR::Add>(ir_stack, std::make_shared<IR::Immediate>(stack_offset));
+		context->m_statements.push_back(std::make_shared<IR::Assign>(ir_stack, _add));
 	}
 
-	// check if pop
-	else if (this->is_pop(context))
+	if (0)
 	{
-		handler_detected = true;
-	}
+		// convert to push/pop
 
-	else if (context->destinations.size() == 0)
-	{
-		const triton::ast::SharedAbstractNode simplified_stack_ast =
-			triton_api->processSimplification(triton_api->getRegisterAst(rb_register), true);
-
-		const triton::ast::SharedAbstractNode simplified_sp_ast =
-			triton_api->processSimplification(triton_api->getRegisterAst(sp_register), true);
-
-		const triton::ast::SharedAbstractNode simplified_bytecode_ast =
-			triton_api->processSimplification(triton_api->getRegisterAst(si_register), true);
-
-		if (simplified_stack_ast->getType() == triton::ast::VARIABLE_NODE
-			&& std::dynamic_pointer_cast<triton::ast::VariableNode>(simplified_stack_ast)->getSymbolicVariable()->getAlias() == "arg0")
+		// constant propagation
+		std::map<std::shared_ptr<IR::Expression>, std::shared_ptr<IR::Expression>> assigned;
+		for (auto it = context->m_statements.begin(); it != context->m_statements.end(); ++it)
 		{
-			// EBP is loaded from ARG0
-			std::cout << "Store SP handler detected" << std::endl;
-			output_strings.push_back("pop esp"); // XD
-			handler_detected = true;
-		}
-		else
-		{
-			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified_sp_ast);
-			if (symvars.size() == 1)
+			const std::shared_ptr<IR::Statement> &expr = *it;
+			if (expr->get_type() == IR::ir_statement_assign)
 			{
-				const triton::ast::SharedAbstractNode _node = *symvars.begin();
-				const triton::engines::symbolic::SharedSymbolicVariable symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(_node)->getSymbolicVariable();
-				if (symvar->getId() == context->symvar_stack->getId())
+				std::shared_ptr<IR::Assign> _assign = std::dynamic_pointer_cast<IR::Assign>(expr);
+				const auto rvalue = _assign->get_right();
+				if (rvalue->get_type() == IR::expr_unary_operation)
 				{
-					// sp = computed by stack
-					analyze_vm_exit(context->address);
-					std::cout << "Ret handler detected" << std::endl;
-					handler_detected = true;
-				}
-			}
-
-			symvars = collect_symvars(simplified_bytecode_ast);
-			if (symvars.size() == 1)
-			{
-				const triton::ast::SharedAbstractNode _node = *symvars.begin();
-				const triton::engines::symbolic::SharedSymbolicVariable symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(_node)->getSymbolicVariable();
-				if (context->arguments.find(symvar->getId()) != context->arguments.end())
-				{
-					// bytecode can be computed by arg -> Jmp handler perhaps
-					std::cout << "Jmp handler detected" << std::endl;
-					handler_detected = true;
-				}
-			}
-		}
-	}
-	else if (context->destinations.size() == 1)
-	{
-		const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(it->second.second, true);
-		std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified);
-
-		// check if push handlers
-		const triton::uint64 runtime_address = it->first;
-		if (simplified->getType() == triton::ast::VARIABLE_NODE)
-		{
-			const triton::engines::symbolic::SharedSymbolicVariable symvar = std::dynamic_pointer_cast<triton::ast::VariableNode>(simplified)->getSymbolicVariable();
-			if (runtime_address == context->stack
-				&& context->stack == stack
-				&& symvar->getAlias() == "fetch_ss:arg0")	// holy fuck
-			{
-				// pop t0
-				// push dword ss:[t0]
-				std::cout << "fetch ss handler detected" << std::endl;
-				handler_detected = true;
-
-				// pop t0
-				std::string variable_name = "t" + std::to_string(++this->m_temp);
-				char buf[256];
-				sprintf_s(buf, 256, "pop %s", variable_name.c_str());
-				output_strings.push_back(buf);
-
-				// push DWORD SS:[t0]
-				sprintf_s(buf, 256, "push SS:[%s]", variable_name.c_str());
-				output_strings.push_back(buf);
-			}
-
-			else if (runtime_address == context->stack
-				&& context->stack == stack
-				&& symvar->getAlias() == "fetch_unknown:arg0")	// holy fuck
-			{
-				// t = pop()
-				// t1 = fetch(t)
-				// push(t1)
-				std::cout << "fetch handler detected" << std::endl;
-				handler_detected = true;
-
-				// pop t0
-				std::string variable_name = "t" + std::to_string(++this->m_temp);
-				char buf[256];
-				sprintf_s(buf, 256, "pop %s", variable_name.c_str());
-				output_strings.push_back(buf);
-
-				// push DWORD SS:[t0]
-				sprintf_s(buf, 256, "push dword ptr [%s]", variable_name.c_str());
-				output_strings.push_back(buf);
-			}
-			else if (runtime_address == (context->stack + 2)
-				&& context->stack == (stack - 2)
-				&& symvar->getAlias() == "fetch_unknown:arg0")
-			{
-				// pop t0
-				// push word ptr [t0]
-				std::cout << "fetch2 handler detected" << std::endl;
-				handler_detected = true;
-
-				// pop t0
-				std::string variable_name = "t" + std::to_string(++this->m_temp);
-				char buf[256];
-				sprintf_s(buf, 256, "pop %s", variable_name.c_str());
-				output_strings.push_back(buf);
-
-				// push DWORD SS:[t0]
-				sprintf_s(buf, 256, "push word ptr [%s]", variable_name.c_str());
-				output_strings.push_back(buf);
-			}
-
-			else if (stack_offset == 8) // this needs to be updated
-			{
-				// pop t0
-				// pop t1
-				// [t0] = t1
-				std::string t0 = "t" + std::to_string(++this->m_temp);
-				std::string t1 = "t" + std::to_string(++this->m_temp);
-
-				// push dword ss:[t0]
-				std::cout << "write4 handler detected" << std::endl;
-				handler_detected = true;
-
-				// pop t0
-				char buf[256];
-				sprintf_s(buf, 256, "pop %s", t0.c_str());
-				output_strings.push_back(buf);
-
-				// pop t1
-				sprintf_s(buf, 256, "pop %s", t1.c_str());
-				output_strings.push_back(buf);
-
-				// [t1] = t0
-				sprintf_s(buf, 256, "[%s] = %s", t0.c_str(), t1.c_str());
-				output_strings.push_back(buf);
-			}
-		}
-
-	}
-	else if (context->destinations.size() == 2)
-	{
-		for (; it != context->destinations.end(); it++)
-		{
-			const triton::ast::SharedAbstractNode simplified_source = triton_api->processSimplification(it->second.second, true);
-			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified_source);
-			if (symvars.size() == 2) // binary operations
-			{
-				// a, b = BINOP(OP_0, OP_1)
-				if (simplified_source->getType() == triton::ast::BVADD_NODE)
-				{
-					// add handler right?
-					std::vector<triton::ast::SharedAbstractNode>& add_children = simplified_source->getChildren();
-					if (add_children.size() == 2
-						&& add_children[0]->getType() == triton::ast::VARIABLE_NODE
-						&& add_children[1]->getType() == triton::ast::VARIABLE_NODE)
+					std::shared_ptr<IR::UnaryOperation> unary_expr = std::dynamic_pointer_cast<IR::UnaryOperation>(rvalue);
+					auto assigned_it = assigned.find(unary_expr->get_expression());
+					if (assigned_it != assigned.end())
 					{
-						std::cout << "ADD handler detected" << std::endl;
-						handler_detected = true;
-
-						// t0 = pop
-						// t1 = pop
-						// t2 = t0 + t1
-						// push t2
-						// push flags t2
-						std::string t0 = "t" + std::to_string(++this->m_temp);
-						std::string t1 = "t" + std::to_string(++this->m_temp);
-						std::string t2 = "t" + std::to_string(++this->m_temp);
-
-						// pop pop add push push
-						// dbg
-						char buf[256];
-						sprintf_s(buf, 256, "pop %s", t0.c_str());
-						output_strings.push_back(buf);
-
-						sprintf_s(buf, 256, "pop %s", t1.c_str());
-						output_strings.push_back(buf);
-
-						sprintf_s(buf, 256, "%s = %s + %s", t2.c_str(), t0.c_str(), t1.c_str());
-						output_strings.push_back(buf);
-
-						sprintf_s(buf, 256, "push %s", t2.c_str());
-						output_strings.push_back(buf);
-
-						sprintf_s(buf, 256, "push flags %s", t2.c_str());
-						output_strings.push_back(buf);
+						unary_expr->set_expression(assigned_it->second);
 					}
 				}
-				else if (simplified_source->getType() == triton::ast::BVLSHR_NODE)
+				else if (rvalue->get_type() == IR::expr_binary_operation)
 				{
-					/*
-					auto symvars_it = symvars.begin();
-					auto _left_node = *symvars_it;
-					symvars_it++;
-					auto _right_node = *symvars_it;
-					printf("SHR(%d, %d)\n", _left_node->getBitvectorSize(), _right_node->getBitvectorSize());
-					*/
+					std::shared_ptr<IR::BinaryOperation> binary_op = std::dynamic_pointer_cast<IR::BinaryOperation>(rvalue);
+					auto assigned_it = assigned.find(binary_op->get_expression0());
+					if (assigned_it != assigned.end())
+					{
+						binary_op->set_expression0(assigned_it->second);
+					}
 
-					// (bvlshr arg0 (concat (_ bv0 1B) ((_ extract 4 0) arg1)))
-					std::cout << "SHR handler detected" << std::endl;
-					handler_detected = true;
-
-					// t0 = pop
-					// t1 = pop
-					// t2 = t0 << t1
-					// push t2
-					// push flags t2
-					std::string t0 = "t" + std::to_string(++this->m_temp);
-					std::string t1 = "t" + std::to_string(++this->m_temp);
-					std::string t2 = "t" + std::to_string(++this->m_temp);
-
-					// pop pop add push push
-					// dbg
-					char buf[256];
-					sprintf_s(buf, 256, "pop %s", t0.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "pop %s", t1.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "%s = SHR(%s, %s)", t2.c_str(), t0.c_str(), t1.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "push %s", t2.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "push flags %s", t2.c_str());
-					output_strings.push_back(buf);
+					assigned_it = assigned.find(binary_op->get_expression1());
+					if (assigned_it != assigned.end())
+					{
+						binary_op->set_expression1(assigned_it->second);
+					}
 				}
-				else if (simplified_source->getType() == triton::ast::BVNOT_NODE)
+				else if (rvalue->get_type() == IR::expr_variable)
 				{
-					// (bvnot (bvor arg0 arg1))
-					std::cout << "NOR handler detected" << std::endl;
-					handler_detected = true;
+					auto assigned_it = assigned.find(rvalue);
+					if (assigned_it != assigned.end()
+						&& assigned.find(assigned_it->second) == assigned.end())
+					{
+						_assign->set_right(assigned_it->second);
+					}
+				}
+				else if (rvalue->get_type() == IR::expr_deref)
+				{
+					std::shared_ptr<IR::Dereference> deref_expr = std::dynamic_pointer_cast<IR::Dereference>(rvalue);
+					auto assigned_it = assigned.find(deref_expr->get_expression());
+					if (assigned_it != assigned.end())
+					{
+						deref_expr->set_expression(assigned_it->second);
+					}
+				}
 
-					// t0 = pop
-					// t1 = pop
-					// t2 = ~t0 & ~t1
-					// push t2
-					// push flags t2
-					std::string t0 = "t" + std::to_string(++this->m_temp);
-					std::string t1 = "t" + std::to_string(++this->m_temp);
-					std::string t2 = "t" + std::to_string(++this->m_temp);
+				assigned[_assign->get_left()] = _assign->get_right();
+			}
+		}
 
-					// pop pop add push push
-					// dbg
-					char buf[256];
-					sprintf_s(buf, 256, "pop %s", t0.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "pop %s", t1.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "%s = NOR(%s, %s)", t2.c_str(), t0.c_str(), t1.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "push %s", t2.c_str());
-					output_strings.push_back(buf);
-
-					sprintf_s(buf, 256, "push flags %s", t2.c_str());
-					output_strings.push_back(buf);
+		// simplify
+		for (int i = 0; i < 10; i++)
+		{
+			for (auto it = context->m_statements.begin(); it != context->m_statements.end(); ++it)
+			{
+				const std::shared_ptr<IR::Statement> statement = *it;
+				switch (statement->get_type())
+				{
+					case IR::ir_statement_assign:
+					{
+						std::shared_ptr<IR::Assign> _assign = std::dynamic_pointer_cast<IR::Assign>(statement);
+						std::shared_ptr<IR::Expression> simplified_rvalue = simplify_expression(_assign->get_right());
+						_assign->set_right(simplified_rvalue);
+						*it = _assign;
+						break;
+					}
+					case IR::ir_statement_push:
+					{
+						std::shared_ptr<IR::Push> _statement = std::dynamic_pointer_cast<IR::Push>(statement);
+						std::shared_ptr<IR::Expression> simplified_rvalue = simplify_expression(_statement->get_expression());
+						_statement->set_expression(simplified_rvalue);
+						*it = _statement;
+						break;
+					}
+					case IR::ir_statement_pop:
+					{
+						std::shared_ptr<IR::Pop> _statement = std::dynamic_pointer_cast<IR::Pop>(statement);
+						std::shared_ptr<IR::Expression> simplified_rvalue = simplify_expression(_statement->get_expression());
+						_statement->set_expression(simplified_rvalue);
+						*it = _statement;
+						break;
+					}
+					default:
+						break;
 				}
 			}
 		}
 	}
-	else if (context->destinations.size() == 3)
+
+	for (const std::shared_ptr<IR::Statement> &expr : context->m_statements)
 	{
-		for (; it != context->destinations.end(); it++)
-		{
-			const triton::ast::SharedAbstractNode simplified = triton_api->processSimplification(it->second.second, true);
-			std::set<triton::ast::SharedAbstractNode> symvars = collect_symvars(simplified);
-			if (symvars.size() == 2)
-			{
-				// (bvmul arg1 arg0)
-				if (simplified->getType() == triton::ast::BVMUL_NODE)
-				{
-					std::vector<triton::ast::SharedAbstractNode>& mul_children = simplified->getChildren();
-					if (mul_children.size() == 2
-						&& mul_children[0]->getType() == triton::ast::VARIABLE_NODE
-						&& mul_children[1]->getType() == triton::ast::VARIABLE_NODE)
-					{
-						std::cout << "(MUL/IMUL) handler detected" << std::endl;
-						handler_detected = true;
-
-						// dbg
-						char buf[256];
-						std::string t0 = "t" + std::to_string(++this->m_temp);
-						std::string t1 = "t" + std::to_string(++this->m_temp);
-						std::string t2 = "t" + std::to_string(++this->m_temp);
-						std::string t3 = "t" + std::to_string(++this->m_temp);
-						std::string t4 = "t" + std::to_string(++this->m_temp);
-
-						// pop, pop, mul, push, push, push
-						sprintf_s(buf, 256, "pop %s", t0.c_str());
-						output_strings.push_back(buf);
-
-						sprintf_s(buf, 256, "pop %s", t1.c_str());
-						output_strings.push_back(buf);
-
-						sprintf_s(buf, 256, "%s, %s, %s = MUL/IMUL(%s, %s)", 
-							t2.c_str(), t3.c_str(), t4.c_str(), t0.c_str(), t1.c_str());
-						output_strings.push_back(buf);
-
-						// push eax, edx, flags
-						sprintf_s(buf, 256, "push %s(eax)", t2.c_str());
-						output_strings.push_back(buf);
-						sprintf_s(buf, 256, "push %s(edx)", t3.c_str());
-						output_strings.push_back(buf);
-						sprintf_s(buf, 256, "push %s(flags)", t4.c_str());
-						output_strings.push_back(buf);
-					}
-				}
-			}
-		}
+		std::stringstream ss;
+		ss << "\t" << expr;
+		output_strings.push_back(ss.str());
 	}
 
 	if (!handler_detected)
 	{
-		this->print_output();
-		getchar();
+		//this->print_output();
+		//output_strings.clear();
+		//getchar();
 	}
 }

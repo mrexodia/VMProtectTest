@@ -19,6 +19,12 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="vmp\IR">
+      <UniqueIdentifier>{791796c7-8e97-462b-b002-6c10777c8582}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="cfg">
+      <UniqueIdentifier>{e9d8ef90-a2ce-4ce1-a1c0-78275a7eeadc}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h">
@@ -47,6 +53,12 @@
     </ClInclude>
     <ClInclude Include="VMProtectAnalyzer.hpp">
       <Filter>vmp</Filter>
+    </ClInclude>
+    <ClInclude Include="IR.hpp">
+      <Filter>vmp\IR</Filter>
+    </ClInclude>
+    <ClInclude Include="CFG.hpp">
+      <Filter>cfg</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -79,6 +91,12 @@
     </ClCompile>
     <ClCompile Include="VMProtectAnalyzer.cpp">
       <Filter>vmp</Filter>
+    </ClCompile>
+    <ClCompile Include="IR.cpp">
+      <Filter>vmp\IR</Filter>
+    </ClCompile>
+    <ClCompile Include="CFG.cpp">
+      <Filter>cfg</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

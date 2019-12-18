@@ -113,15 +113,15 @@ void test_v1()
 
 	VMProtectAnalyzer analyzer;
 	analyzer.load(stream, 0x00400000, 0x17000, 0x86CB0);
-	//analyzer.analyze_vm_enter(stream, 0x0040C890);
-	analyzer.analyze_vm_enter(stream, 0x004312D7);
+	analyzer.analyze_vm_enter(stream, 0x0040C890);
+	//analyzer.analyze_vm_enter(stream, 0x004312D7);
 	//analyzer.analyze_vm_enter(stream, 0x0041F618);
 	//analyzer.analyze_vm_enter(stream, 0x00477CBB);
 
 	unsigned long long handler_address = analyzer.get_ip();
-	std::cout << std::hex << handler_address << std::endl;
 	while (handler_address)
 	{
+		std::cout << std::hex << handler_address << std::endl;
 		analyzer.analyze_vm_handler(stream, handler_address);
 		std::cout << std::endl << std::endl << std::endl << std::endl;
 		handler_address = analyzer.get_ip();
@@ -131,6 +131,51 @@ void test_v1()
 	std::cout << std::endl << std::endl;
 	analyzer.print_output();
 }
+void test_demo()
+{
+	DWORD processId = find_process(L"Demo.vmp.exe");
+	printf("pid: %08X\n", processId);
+
+	ProcessStream stream;
+	if (!stream.open(processId))
+		throw std::runtime_error("stream.open failed.");
+
+	VMProtectAnalyzer analyzer;
+	analyzer.load(stream, 0x01150000, 0x4000, 0x8D620);
+
+	if (false)
+	{
+		// run through
+		analyzer.analyze_vm_enter(stream, 0x01151020);
+		triton::uint64 handler_address = analyzer.get_ip();
+		std::cout << std::hex << handler_address << std::endl;
+		while (handler_address)
+		{
+			analyzer.analyze_vm_handler(stream, handler_address);
+			std::cout << std::endl << std::endl << std::endl << std::endl;
+			handler_address = analyzer.get_ip();
+		}
+	}
+	else
+	{
+		// test handlers
+		for (int i = 20; i <= 0xFF; i++)
+		{
+			triton::uint64 handler_address = 0;
+			stream.seek(0x011C4294 + (i * 4));
+			stream.read(&handler_address, 4);
+
+			std::cout << i << " " << std::hex << handler_address << std::endl;
+			analyzer.analyze_vm_handler(stream, handler_address);
+			std::cout << std::endl << std::endl << std::endl << std::endl;
+		}
+	}
+	// idk
+	std::cout << std::endl << std::endl;
+	analyzer.print_output();
+}
+
+
 
 int main()
 {
@@ -139,7 +184,7 @@ int main()
 
 	try
 	{
-		//vmp_ultimate();
+		//test_demo();
 		test_v1();
 	}
 	catch (const std::exception &ex)
